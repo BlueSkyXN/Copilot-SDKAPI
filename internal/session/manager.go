@@ -21,6 +21,9 @@ type Spec struct {
 	SystemPromptMode string
 	ReasoningEffort  string
 	Agent            string
+	Interactive      bool
+	ToolsFingerprint string
+	PermissionMode   gatewayruntime.PermissionMode
 }
 
 type Manager struct {
@@ -28,16 +31,24 @@ type Manager struct {
 	now                   func() time.Time
 	maxActiveSessions     int
 	maxActivePerNamespace int
+	store                 Store
 	mu                    sync.Mutex
 	sessions              map[string]*managedSession
 }
 
 type managedSession struct {
-	key      string
-	spec     Spec
-	session  gatewayruntime.Session
-	lastUsed atomic.Int64
-	mu       sync.Mutex
+	key        string
+	spec       Spec
+	sessionID  string
+	session    gatewayruntime.Session
+	deleteByID func(context.Context, string) error
+	createdAt  time.Time
+	lastUsed   atomic.Int64
+	mu         sync.Mutex
+	activityMu sync.Mutex
+	activity   func()
+	ready      chan struct{}
+	readyOnce  sync.Once
 }
 
 const sessionLockRetryInterval = 5 * time.Millisecond
@@ -59,20 +70,32 @@ type Limits struct {
 }
 
 func NewManager(ttl time.Duration) *Manager {
-	return NewManagerWithLimits(ttl, Limits{})
+	return NewManagerWithStore(ttl, Limits{}, nil)
 }
 
 func NewManagerWithLimits(ttl time.Duration, limits Limits) *Manager {
+	return NewManagerWithStore(ttl, limits, nil)
+}
+
+func NewManagerWithStore(ttl time.Duration, limits Limits, store Store) *Manager {
 	return &Manager{
 		ttl:                   ttl,
 		now:                   time.Now,
 		maxActiveSessions:     limits.MaxActiveSessions,
 		maxActivePerNamespace: limits.MaxActivePerNamespace,
+		store:                 store,
 		sessions:              make(map[string]*managedSession),
 	}
 }
 
-func (m *Manager) Acquire(ctx context.Context, key string, spec Spec, factory func(context.Context) (gatewayruntime.Session, error)) (*Lease, error) {
+func (m *Manager) Acquire(
+	ctx context.Context,
+	key string,
+	spec Spec,
+	factory func(context.Context) (gatewayruntime.Session, error),
+	resume func(context.Context, string) (gatewayruntime.Session, error),
+	deleteByID func(context.Context, string) error,
+) (*Lease, error) {
 	if key == "" {
 		sess, err := createSessionWithContext(ctx, factory)
 		if err != nil {
@@ -123,15 +146,21 @@ func (m *Manager) Acquire(ctx context.Context, key string, spec Spec, factory fu
 		}
 
 		entry = &managedSession{
-			key:  key,
-			spec: spec,
+			key:        key,
+			spec:       spec,
+			deleteByID: deleteByID,
+			ready:      make(chan struct{}),
 		}
 		entry.mu.Lock()
 		m.sessions[key] = entry
 		m.mu.Unlock()
-
-		sess, err := createSessionWithContext(ctx, factory)
-		if err != nil {
+		readyMarked := false
+		defer func() {
+			if !readyMarked {
+				entry.markReady()
+			}
+		}()
+		cleanupEntry := func() {
 			m.mu.Lock()
 			current, ok := m.sessions[key]
 			if ok && current == entry {
@@ -139,12 +168,92 @@ func (m *Manager) Acquire(ctx context.Context, key string, spec Spec, factory fu
 			}
 			m.mu.Unlock()
 			entry.mu.Unlock()
+		}
+		var persisted *StoredSession
+		if m.store != nil {
+			record, err := m.store.Load(key)
+			if err != nil {
+				cleanupEntry()
+				return nil, err
+			}
+			if record != nil {
+				if record.Spec != spec {
+					if err := m.removeStoredSession(ctx, key, record, deleteByID); err != nil {
+						cleanupEntry()
+						return nil, err
+					}
+					cleanupEntry()
+					return nil, ErrSessionSpecMismatch
+				}
+				if m.ttl > 0 && m.now().Sub(record.UpdatedAt) >= m.ttl {
+					if err := m.removeStoredSession(ctx, key, record, deleteByID); err != nil {
+						cleanupEntry()
+						return nil, err
+					}
+				} else {
+					persisted = record
+				}
+			}
+		}
+
+		var (
+			sess    gatewayruntime.Session
+			err     error
+			created = true
+		)
+		if persisted != nil && resume != nil {
+			sess, err = createSessionWithContext(ctx, func(factoryCtx context.Context) (gatewayruntime.Session, error) {
+				return resume(factoryCtx, persisted.SessionID)
+			})
+			if err != nil {
+				if !errors.Is(err, gatewayruntime.ErrSessionNotFound) {
+					cleanupEntry()
+					return nil, err
+				}
+				if m.store != nil {
+					if storeErr := m.store.Delete(key); storeErr != nil {
+						cleanupEntry()
+						return nil, storeErr
+					}
+				}
+				persisted = nil
+			} else {
+				created = false
+			}
+		}
+		if sess == nil {
+			sess, err = createSessionWithContext(ctx, factory)
+		}
+		if err != nil {
+			cleanupEntry()
 			return nil, err
 		}
 
+		entry.sessionID = sess.ID()
+		if persisted != nil && !persisted.CreatedAt.IsZero() {
+			entry.createdAt = persisted.CreatedAt
+		} else {
+			entry.createdAt = m.now()
+		}
 		entry.session = sess
 		entry.touch(m.now())
-		return m.newLease(key, entry, true), nil
+		if m.store != nil {
+			now := m.now()
+			record := StoredSession{
+				SessionID: sess.ID(),
+				Spec:      spec,
+				CreatedAt: entry.createdAt,
+				UpdatedAt: now,
+			}
+			if err := m.store.Save(key, record); err != nil {
+				_ = entry.session.Close()
+				cleanupEntry()
+				return nil, err
+			}
+		}
+		entry.markReady()
+		readyMarked = true
+		return m.newLease(key, entry, created), nil
 	}
 }
 
@@ -192,7 +301,7 @@ func (m *Manager) CleanupExpired() error {
 
 	var firstErr error
 	for _, entry := range stale {
-		if err := entry.session.Close(); err != nil && firstErr == nil {
+		if err := m.destroyPersistentSession(context.Background(), entry); err != nil && firstErr == nil {
 			firstErr = err
 		}
 		entry.mu.Unlock()
@@ -202,6 +311,21 @@ func (m *Manager) CleanupExpired() error {
 
 func (m *managedSession) touch(now time.Time) {
 	m.lastUsed.Store(now.UnixNano())
+}
+
+func (m *managedSession) waitReady() {
+	if m.ready == nil {
+		return
+	}
+	<-m.ready
+}
+
+func (m *managedSession) markReady() {
+	m.readyOnce.Do(func() {
+		if m.ready != nil {
+			close(m.ready)
+		}
+	})
 }
 
 func lockManagedSession(ctx context.Context, entry *managedSession) error {
@@ -236,6 +360,14 @@ func (m *Manager) Close() error {
 }
 
 func (m *Manager) CloseContext(ctx context.Context) error {
+	return m.closeContext(ctx, false)
+}
+
+func (m *Manager) DisconnectContext(ctx context.Context) error {
+	return m.closeContext(ctx, true)
+}
+
+func (m *Manager) closeContext(ctx context.Context, preservePersistent bool) error {
 	m.mu.Lock()
 	entries := make([]*managedSession, 0, len(m.sessions))
 	for key, entry := range m.sessions {
@@ -252,7 +384,13 @@ func (m *Manager) CloseContext(ctx context.Context) error {
 			}
 			continue
 		}
-		if err := entry.session.Close(); err != nil && firstErr == nil {
+		var err error
+		if preservePersistent {
+			err = m.disconnectPersistentSession(entry)
+		} else {
+			err = m.destroyPersistentSession(ctx, entry)
+		}
+		if err != nil && firstErr == nil {
 			firstErr = err
 		}
 		entry.mu.Unlock()
@@ -263,13 +401,23 @@ func (m *Manager) CloseContext(ctx context.Context) error {
 func (m *Manager) newLease(key string, entry *managedSession, created bool) *Lease {
 	return &Lease{
 		session:    entry.session,
-		sessionID:  entry.session.ID(),
+		sessionID:  entry.sessionID,
 		persistent: true,
 		created:    created,
 		release: func() error {
-			entry.touch(m.now())
+			now := m.now()
+			entry.touch(now)
+			var err error
+			if m.store != nil {
+				err = m.store.Save(key, StoredSession{
+					SessionID: entry.sessionID,
+					Spec:      entry.spec,
+					CreatedAt: entry.createdAt,
+					UpdatedAt: now,
+				})
+			}
 			entry.mu.Unlock()
-			return nil
+			return err
 		},
 		discard: func() error {
 			m.mu.Lock()
@@ -278,11 +426,41 @@ func (m *Manager) newLease(key string, entry *managedSession, created bool) *Lea
 				delete(m.sessions, key)
 			}
 			m.mu.Unlock()
-			err := entry.session.Close()
+			err := m.destroyPersistentSession(context.Background(), entry)
 			entry.mu.Unlock()
 			return err
 		},
 	}
+}
+
+func (m *Manager) destroyPersistentSession(ctx context.Context, entry *managedSession) error {
+	var firstErr error
+	if entry.session != nil {
+		if err := entry.session.Close(); err != nil && !errors.Is(err, gatewayruntime.ErrSessionNotFound) && firstErr == nil {
+			firstErr = err
+		}
+	}
+	if entry.key != "" && m.store != nil {
+		if err := m.store.Delete(entry.key); err != nil && firstErr == nil {
+			firstErr = err
+		}
+	}
+	if entry.sessionID != "" && entry.deleteByID != nil {
+		if err := entry.deleteByID(ctx, entry.sessionID); err != nil && !errors.Is(err, gatewayruntime.ErrSessionNotFound) && firstErr == nil {
+			firstErr = err
+		}
+	}
+	return firstErr
+}
+
+func (m *Manager) disconnectPersistentSession(entry *managedSession) error {
+	if entry.session == nil {
+		return nil
+	}
+	if err := entry.session.Close(); err != nil && !errors.Is(err, gatewayruntime.ErrSessionNotFound) {
+		return err
+	}
+	return nil
 }
 
 func createSessionWithContext(ctx context.Context, factory func(context.Context) (gatewayruntime.Session, error)) (gatewayruntime.Session, error) {
@@ -316,6 +494,76 @@ func sessionNamespace(key string) string {
 		return prefix
 	}
 	return key
+}
+
+func (m *Manager) Lookup(key string) gatewayruntime.Session {
+	if strings.TrimSpace(key) == "" {
+		return nil
+	}
+	m.mu.Lock()
+	entry := m.sessions[key]
+	m.mu.Unlock()
+	if entry == nil {
+		return nil
+	}
+	entry.waitReady()
+	return entry.session
+}
+
+func (m *Manager) SetActivityHook(key string, hook func()) func() {
+	if strings.TrimSpace(key) == "" {
+		return func() {}
+	}
+	m.mu.Lock()
+	entry := m.sessions[key]
+	m.mu.Unlock()
+	if entry == nil {
+		return func() {}
+	}
+	entry.activityMu.Lock()
+	entry.activity = hook
+	entry.activityMu.Unlock()
+	return func() {
+		entry.activityMu.Lock()
+		if entry.activity != nil {
+			entry.activity = nil
+		}
+		entry.activityMu.Unlock()
+	}
+}
+
+func (m *Manager) TouchActivity(key string) {
+	if strings.TrimSpace(key) == "" {
+		return
+	}
+	m.mu.Lock()
+	entry := m.sessions[key]
+	m.mu.Unlock()
+	if entry == nil {
+		return
+	}
+	entry.waitReady()
+	entry.activityMu.Lock()
+	hook := entry.activity
+	entry.activityMu.Unlock()
+	if hook != nil {
+		hook()
+	}
+}
+
+func (m *Manager) removeStoredSession(ctx context.Context, key string, record *StoredSession, deleteByID func(context.Context, string) error) error {
+	if record == nil || m.store == nil {
+		return nil
+	}
+	if err := m.store.Delete(key); err != nil {
+		return err
+	}
+	if deleteByID != nil {
+		if err := deleteByID(ctx, record.SessionID); err != nil && !errors.Is(err, gatewayruntime.ErrSessionNotFound) {
+			return err
+		}
+	}
+	return nil
 }
 
 func (l *Lease) Session() gatewayruntime.Session {

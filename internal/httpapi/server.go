@@ -3,15 +3,24 @@ package httpapi
 import (
 	"context"
 	"crypto/rand"
+	"crypto/sha256"
+	"encoding/base64"
 	"encoding/hex"
 	"encoding/json"
 	"errors"
 	"fmt"
 	"io"
 	"log/slog"
+	"net"
 	"net/http"
+	"net/netip"
+	"net/url"
 	"os"
+	"path"
+	"path/filepath"
+	"sort"
 	"strings"
+	"sync/atomic"
 	"time"
 
 	"copilot-sdkapi/internal/auth"
@@ -24,14 +33,49 @@ import (
 
 var errStreamIdleTimeout = errors.New("stream idle timeout exceeded")
 var errInvalidSessionKey = errors.New("invalid session key")
+var errMissingSessionKey = errors.New("X-Session-ID header is required")
 var errInvalidAnthropicVersion = errors.New("unsupported anthropic-version header")
 var errUnsupportedReasoningEffort = errors.New("reasoning effort is not supported by the selected model")
 var errUnsupportedVisionModel = errors.New("image input is not supported by the selected model")
 var errModelLimitsExceeded = errors.New("request exceeds model capability limits")
 var errInvalidSystemMessageMode = errors.New("unsupported x_copilot.system_message_mode")
 var errUnknownAgent = errors.New("unknown x_copilot.agent")
+var errInteractiveRequiresStream = errors.New("x_copilot continuation flows require stream=true")
+var errInteractiveRequiresSessionKey = errors.New("x_copilot continuation flows require X-Session-ID")
+var errInvalidCopilotPermissionMode = errors.New("unsupported x_copilot.permission_mode")
+var errCopilotPermissionEscalation = errors.New("x_copilot.permission_mode cannot exceed server permission policy")
+var errInvalidCopilotTool = errors.New("invalid x_copilot.tools entry")
+var errInvalidCopilotResponse = errors.New("invalid x_copilot continuation request")
+var errInvalidCopilotAttachment = errors.New("invalid x_copilot attachment")
 
 const supportedAnthropicVersion = "2023-06-01"
+
+var blockedRemoteIPPrefixes = []netip.Prefix{
+	mustParsePrefix("0.0.0.0/8"),
+	mustParsePrefix("10.0.0.0/8"),
+	mustParsePrefix("100.64.0.0/10"),
+	mustParsePrefix("127.0.0.0/8"),
+	mustParsePrefix("169.254.0.0/16"),
+	mustParsePrefix("172.16.0.0/12"),
+	mustParsePrefix("192.0.0.0/24"),
+	mustParsePrefix("192.0.2.0/24"),
+	mustParsePrefix("192.88.99.0/24"),
+	mustParsePrefix("192.168.0.0/16"),
+	mustParsePrefix("198.18.0.0/15"),
+	mustParsePrefix("198.51.100.0/24"),
+	mustParsePrefix("203.0.113.0/24"),
+	mustParsePrefix("224.0.0.0/4"),
+	mustParsePrefix("240.0.0.0/4"),
+	mustParsePrefix("::/128"),
+	mustParsePrefix("::1/128"),
+	mustParsePrefix("100::/64"),
+	mustParsePrefix("2001:2::/48"),
+	mustParsePrefix("2001:10::/28"),
+	mustParsePrefix("2001:db8::/32"),
+	mustParsePrefix("fc00::/7"),
+	mustParsePrefix("fe80::/10"),
+	mustParsePrefix("ff00::/8"),
+}
 
 type Server struct {
 	cfg      config.Config
@@ -85,6 +129,7 @@ func (s *Server) routes() {
 	s.mux.HandleFunc("/v1/models", s.handleModels)
 	s.mux.HandleFunc("/v1/chat/completions", s.handleOpenAIChatCompletions)
 	s.mux.HandleFunc("/v1/messages", s.handleClaudeMessages)
+	s.mux.HandleFunc("/v1/copilot/respond", s.handleCopilotResponse)
 }
 
 func (s *Server) handleHealthz(w http.ResponseWriter, r *http.Request) {
@@ -186,6 +231,8 @@ func (s *Server) handleOpenAIChatCompletions(w http.ResponseWriter, r *http.Requ
 			}
 			_ = prepared.lease.Release()
 		}()
+		clearActivity := s.sessions.SetActivityHook(scopedKey, touch)
+		defer clearActivity()
 
 		sessionID = prepared.lease.SessionID()
 		model = prepared.model
@@ -308,6 +355,8 @@ func (s *Server) handleClaudeMessages(w http.ResponseWriter, r *http.Request) {
 			}
 			_ = prepared.lease.Release()
 		}()
+		clearActivity := s.sessions.SetActivityHook(scopedKey, touch)
+		defer clearActivity()
 
 		sessionID = prepared.lease.SessionID()
 		model = prepared.model
@@ -361,27 +410,59 @@ func (s *Server) handleClaudeMessages(w http.ResponseWriter, r *http.Request) {
 
 func (s *Server) prepareConversation(ctx context.Context, externalSessionKey string, request compat.ConversationRequest) (*preparedConversation, error) {
 	model := s.resolveModel(request.Model)
+	permissionMode, err := effectivePermissionMode(request.Copilot.PermissionMode, s.cfg.SDKPermissionMode)
+	if err != nil {
+		return nil, err
+	}
+	requiresContinuation := request.Copilot.Interactive || len(request.Copilot.Tools) > 0 || permissionMode == gatewayruntime.PermissionModeBridge
+	if externalSessionKey == "" && requiresContinuation {
+		return nil, errInteractiveRequiresSessionKey
+	}
 	if err := s.validateConversationFeatures(ctx, model, request); err != nil {
 		return nil, err
 	}
 	systemMessageMode := effectiveSystemMessageMode(request.Copilot.SystemMessageMode)
 	agent := effectiveAgent(request.Copilot.Agent, s.cfg.SDKDefaultAgent)
+	runtimeTools := toRuntimeTools(request.Copilot.Tools)
+	toolsFingerprint, err := toolDefinitionsFingerprint(request.Copilot.Tools)
+	if err != nil {
+		return nil, fmt.Errorf("%w: %v", errInvalidCopilotTool, err)
+	}
 	spec := session.Spec{
 		Model:            model,
 		SystemPrompt:     request.SystemPrompt,
 		SystemPromptMode: systemMessageMode,
 		ReasoningEffort:  request.ReasoningEffort,
 		Agent:            agent,
+		Interactive:      request.Copilot.Interactive,
+		ToolsFingerprint: toolsFingerprint,
+		PermissionMode:   permissionMode,
 	}
 	lease, err := s.sessions.Acquire(ctx, externalSessionKey, spec, func(factoryCtx context.Context) (gatewayruntime.Session, error) {
 		return s.provider.NewSession(factoryCtx, gatewayruntime.SessionOptions{
+			SessionID:        externalSessionKey,
 			Model:            model,
 			SystemPrompt:     request.SystemPrompt,
 			SystemPromptMode: systemMessageMode,
 			ReasoningEffort:  request.ReasoningEffort,
 			Agent:            agent,
+			Interactive:      request.Copilot.Interactive,
+			Tools:            runtimeTools,
+			PermissionMode:   permissionMode,
 		})
-	})
+	}, func(factoryCtx context.Context, sessionID string) (gatewayruntime.Session, error) {
+		return s.provider.ResumeSession(factoryCtx, sessionID, gatewayruntime.SessionOptions{
+			SessionID:        sessionID,
+			Model:            model,
+			SystemPrompt:     request.SystemPrompt,
+			SystemPromptMode: systemMessageMode,
+			ReasoningEffort:  request.ReasoningEffort,
+			Agent:            agent,
+			Interactive:      request.Copilot.Interactive,
+			Tools:            runtimeTools,
+			PermissionMode:   permissionMode,
+		})
+	}, s.provider.DeleteSession)
 	if err != nil {
 		return nil, err
 	}
@@ -402,11 +483,28 @@ func (s *Server) prepareConversation(ctx context.Context, externalSessionKey str
 		_ = lease.Release()
 		return nil, err
 	}
-	attachments, cleanup, err := s.materializeAttachments(latestTurn.Attachments)
+	imageAttachments, imageCleanup, err := s.materializeAttachments(ctx, latestTurn.Attachments)
 	if err != nil {
 		_ = lease.Release()
 		return nil, err
 	}
+	extraAttachments, extraCleanup, err := s.materializeCopilotAttachments(ctx, request.Copilot.Attachments)
+	if err != nil {
+		if imageCleanup != nil {
+			_ = imageCleanup()
+		}
+		_ = lease.Release()
+		return nil, err
+	}
+	cleanup := combineCleanup(imageCleanup, extraCleanup)
+	if err := s.validateMaterializedImageAttachments(ctx, model, imageAttachments); err != nil {
+		if cleanup != nil {
+			_ = cleanup()
+		}
+		_ = lease.Release()
+		return nil, err
+	}
+	attachments := append(imageAttachments, extraAttachments...)
 
 	return &preparedConversation{
 		lease: lease,
@@ -419,7 +517,7 @@ func (s *Server) prepareConversation(ctx context.Context, externalSessionKey str
 		agent:                agent,
 		systemMessageMode:    systemMessageMode,
 		includeReasoning:     request.Copilot.IncludeReasoning,
-		includeRuntimeEvents: request.Copilot.IncludeRuntimeEvents,
+		includeRuntimeEvents: request.Copilot.IncludeRuntimeEvents || request.Copilot.Interactive || len(request.Copilot.Tools) > 0 || permissionMode == gatewayruntime.PermissionModeBridge,
 		copilotRequested:     hasCopilotRequestExtension(request.Copilot),
 	}, nil
 }
@@ -790,9 +888,13 @@ func classifyError(err error) (int, string, string) {
 		return http.StatusBadRequest, "invalid_request_error", err.Error()
 	case errors.Is(err, errInvalidSessionKey):
 		return http.StatusBadRequest, "invalid_request_error", err.Error()
+	case errors.Is(err, errMissingSessionKey):
+		return http.StatusBadRequest, "invalid_request_error", err.Error()
 	case errors.Is(err, errInvalidAnthropicVersion):
 		return http.StatusBadRequest, "invalid_request_error", err.Error()
 	case errors.Is(err, errInvalidSystemMessageMode), errors.Is(err, errUnknownAgent):
+		return http.StatusBadRequest, "invalid_request_error", err.Error()
+	case errors.Is(err, errInteractiveRequiresStream), errors.Is(err, errInteractiveRequiresSessionKey), errors.Is(err, errInvalidCopilotPermissionMode), errors.Is(err, errCopilotPermissionEscalation), errors.Is(err, errInvalidCopilotTool), errors.Is(err, errInvalidCopilotResponse), errors.Is(err, errInvalidCopilotAttachment):
 		return http.StatusBadRequest, "invalid_request_error", err.Error()
 	case errors.Is(err, errUnsupportedReasoningEffort), errors.Is(err, errUnsupportedVisionModel), errors.Is(err, errModelLimitsExceeded):
 		return http.StatusBadRequest, "invalid_request_error", err.Error()
@@ -802,6 +904,10 @@ func classifyError(err error) (int, string, string) {
 		return http.StatusTooManyRequests, "session_limit_exceeded", err.Error()
 	case errors.Is(err, session.ErrTooManySessions):
 		return http.StatusServiceUnavailable, "session_capacity_exceeded", err.Error()
+	case errors.Is(err, gatewayruntime.ErrPendingRequestNotFound):
+		return http.StatusNotFound, "invalid_request_error", err.Error()
+	case errors.Is(err, gatewayruntime.ErrPendingRequestsUnsupported):
+		return http.StatusConflict, "session_conflict", err.Error()
 	default:
 		return http.StatusBadGateway, "upstream_error", err.Error()
 	}
@@ -920,6 +1026,16 @@ func (s *Server) validateConversationFeatures(ctx context.Context, modelID strin
 	if agent := strings.TrimSpace(request.Copilot.Agent); agent != "" && !s.hasCustomAgent(agent) {
 		return fmt.Errorf("%w: %s", errUnknownAgent, agent)
 	}
+	permissionMode, err := effectivePermissionMode(request.Copilot.PermissionMode, s.cfg.SDKPermissionMode)
+	if err != nil {
+		return err
+	}
+	if (request.Copilot.Interactive || len(request.Copilot.Tools) > 0 || permissionMode == gatewayruntime.PermissionModeBridge) && !request.Stream {
+		return errInteractiveRequiresStream
+	}
+	if err := validateCopilotTools(request.Copilot.Tools); err != nil {
+		return err
+	}
 
 	if err := compat.ValidateAttachmentPlacement(request.Turns, false); err != nil {
 		return err
@@ -967,6 +1083,11 @@ func (s *Server) validateConversationFeatures(ctx context.Context, modelID strin
 	}
 	if limit := model.Limits.Vision.MaxPromptImages; limit > 0 && len(latest.Attachments) > limit {
 		return fmt.Errorf("%w: max_prompt_images=%d", errModelLimitsExceeded, limit)
+	}
+	for _, attachment := range latest.Attachments {
+		if len(attachment.Data) == 0 {
+			return nil
+		}
 	}
 	if len(model.Limits.Vision.SupportedMediaTypes) > 0 {
 		allowed := make(map[string]struct{}, len(model.Limits.Vision.SupportedMediaTypes))
@@ -1042,14 +1163,102 @@ func effectiveAgent(requestAgent, defaultAgent string) string {
 	return strings.TrimSpace(defaultAgent)
 }
 
+func effectivePermissionMode(requestMode string, defaultMode gatewayruntime.PermissionMode) (gatewayruntime.PermissionMode, error) {
+	if defaultMode == "" || defaultMode == gatewayruntime.PermissionModeInherit {
+		defaultMode = gatewayruntime.PermissionModeDeny
+	}
+	switch normalized := gatewayruntime.PermissionMode(strings.ToLower(strings.TrimSpace(requestMode))); normalized {
+	case "", gatewayruntime.PermissionModeInherit:
+		return defaultMode, nil
+	case gatewayruntime.PermissionModeAllow, gatewayruntime.PermissionModeDeny, gatewayruntime.PermissionModeBridge:
+		if permissionModeRank(normalized) > permissionModeRank(defaultMode) {
+			return "", fmt.Errorf("%w: requested=%s server=%s", errCopilotPermissionEscalation, normalized, defaultMode)
+		}
+		return normalized, nil
+	default:
+		return "", fmt.Errorf("%w: %s", errInvalidCopilotPermissionMode, requestMode)
+	}
+}
+
+func permissionModeRank(mode gatewayruntime.PermissionMode) int {
+	switch mode {
+	case gatewayruntime.PermissionModeAllow:
+		return 2
+	case gatewayruntime.PermissionModeBridge:
+		return 1
+	default:
+		return 0
+	}
+}
+
 func hasCopilotRequestExtension(extension compat.CopilotRequestExtension) bool {
 	return extension.IncludeReasoning ||
 		extension.IncludeRuntimeEvents ||
+		extension.Interactive ||
+		strings.TrimSpace(extension.PermissionMode) != "" ||
+		len(extension.Attachments) > 0 ||
+		len(extension.Tools) > 0 ||
 		strings.TrimSpace(extension.Agent) != "" ||
 		strings.TrimSpace(extension.SystemMessageMode) != ""
 }
 
-func (s *Server) materializeAttachments(images []compat.ImageAttachment) ([]gatewayruntime.Attachment, func() error, error) {
+func toRuntimeTools(definitions []compat.CopilotToolDefinition) []gatewayruntime.ToolDefinition {
+	if len(definitions) == 0 {
+		return nil
+	}
+	tools := make([]gatewayruntime.ToolDefinition, 0, len(definitions))
+	for _, definition := range definitions {
+		var parameters map[string]any
+		if definition.Parameters != nil {
+			parameters = cloneAny(definition.Parameters).(map[string]any)
+		}
+		tools = append(tools, gatewayruntime.ToolDefinition{
+			Name:            definition.Name,
+			Description:     definition.Description,
+			Parameters:      parameters,
+			OverrideBuiltIn: definition.OverrideBuiltIn,
+		})
+	}
+	return tools
+}
+
+func toolDefinitionsFingerprint(definitions []compat.CopilotToolDefinition) (string, error) {
+	if len(definitions) == 0 {
+		return "", nil
+	}
+	serialized := make([]string, 0, len(definitions))
+	for _, definition := range definitions {
+		encoded, err := json.Marshal(definition)
+		if err != nil {
+			return "", err
+		}
+		serialized = append(serialized, string(encoded))
+	}
+	sort.Strings(serialized)
+	encoded, err := json.Marshal(serialized)
+	if err != nil {
+		return "", err
+	}
+	sum := sha256.Sum256(encoded)
+	return hex.EncodeToString(sum[:]), nil
+}
+
+func validateCopilotTools(definitions []compat.CopilotToolDefinition) error {
+	for _, definition := range definitions {
+		if strings.TrimSpace(definition.Name) == "" {
+			return fmt.Errorf("%w: name is required", errInvalidCopilotTool)
+		}
+		if definition.Parameters == nil {
+			continue
+		}
+		if rawType, ok := definition.Parameters["type"].(string); ok && rawType != "" && rawType != "object" {
+			return fmt.Errorf("%w: tool %s parameters.type must be object", errInvalidCopilotTool, definition.Name)
+		}
+	}
+	return nil
+}
+
+func (s *Server) materializeAttachments(ctx context.Context, images []compat.ImageAttachment) ([]gatewayruntime.Attachment, func() error, error) {
 	if len(images) == 0 {
 		return nil, nil, nil
 	}
@@ -1059,7 +1268,46 @@ func (s *Server) materializeAttachments(images []compat.ImageAttachment) ([]gate
 		return nil, nil, err
 	}
 
+	cleanup := func() error {
+		if err := os.RemoveAll(dir); err != nil && !errors.Is(err, os.ErrNotExist) {
+			return err
+		}
+		return nil
+	}
 	attachments := make([]gatewayruntime.Attachment, 0, len(images))
+	for _, image := range images {
+		mediaType := image.MediaType
+		data := image.Data
+		nameHint := "image"
+		if strings.TrimSpace(image.URL) != "" {
+			fetchedType, fetchedData, fetchedName, err := s.fetchRemoteAttachment(ctx, image.URL)
+			if err != nil {
+				_ = cleanup()
+				return nil, nil, err
+			}
+			mediaType = fetchedType
+			data = fetchedData
+			nameHint = fetchedName
+		}
+		attachment, err := writeAttachmentFile(dir, nameHint, mediaType, data)
+		if err != nil {
+			_ = cleanup()
+			return nil, nil, err
+		}
+		attachments = append(attachments, attachment)
+	}
+	return attachments, cleanup, nil
+}
+
+func (s *Server) materializeCopilotAttachments(ctx context.Context, inputs []compat.CopilotAttachment) ([]gatewayruntime.Attachment, func() error, error) {
+	if len(inputs) == 0 {
+		return nil, nil, nil
+	}
+
+	dir, err := os.MkdirTemp("", "copilot-sdkapi-files-*")
+	if err != nil {
+		return nil, nil, err
+	}
 	cleanup := func() error {
 		if err := os.RemoveAll(dir); err != nil && !errors.Is(err, os.ErrNotExist) {
 			return err
@@ -1067,32 +1315,304 @@ func (s *Server) materializeAttachments(images []compat.ImageAttachment) ([]gate
 		return nil
 	}
 
-	for _, image := range images {
-		file, err := os.CreateTemp(dir, "image-*"+extensionForMediaType(image.MediaType))
+	attachments := make([]gatewayruntime.Attachment, 0, len(inputs))
+	for _, input := range inputs {
+		attachment, err := s.materializeCopilotAttachment(ctx, dir, input)
 		if err != nil {
 			_ = cleanup()
 			return nil, nil, err
 		}
-		if _, err := file.Write(image.Data); err != nil {
-			name := file.Name()
-			_ = file.Close()
-			_ = os.Remove(name)
-			_ = cleanup()
-			return nil, nil, err
+		attachments = append(attachments, attachment)
+	}
+	return attachments, cleanup, nil
+}
+
+func (s *Server) materializeCopilotAttachment(ctx context.Context, dir string, input compat.CopilotAttachment) (gatewayruntime.Attachment, error) {
+	nameHint := strings.TrimSpace(input.Name)
+	if nameHint == "" {
+		nameHint = "attachment"
+	}
+	mediaType := strings.TrimSpace(input.MediaType)
+	switch {
+	case strings.TrimSpace(input.Data) != "":
+		decoded, err := base64.StdEncoding.DecodeString(input.Data)
+		if err != nil {
+			return gatewayruntime.Attachment{}, fmt.Errorf("%w: %v", errInvalidCopilotAttachment, err)
 		}
-		if err := file.Close(); err != nil {
-			name := file.Name()
-			_ = os.Remove(name)
-			_ = cleanup()
-			return nil, nil, err
+		return writeAttachmentFile(dir, nameHint, mediaType, decoded)
+	case strings.TrimSpace(input.Text) != "":
+		if mediaType == "" {
+			mediaType = "text/plain"
 		}
-		attachments = append(attachments, gatewayruntime.Attachment{
-			Path:      file.Name(),
-			MediaType: image.MediaType,
-		})
+		return writeAttachmentFile(dir, nameHint, mediaType, []byte(input.Text))
+	case strings.TrimSpace(input.URL) != "":
+		fetchedType, fetchedData, fetchedName, err := s.fetchRemoteAttachment(ctx, input.URL)
+		if err != nil {
+			return gatewayruntime.Attachment{}, err
+		}
+		if mediaType == "" {
+			mediaType = fetchedType
+		}
+		if strings.TrimSpace(input.Name) == "" {
+			nameHint = fetchedName
+		}
+		return writeAttachmentFile(dir, nameHint, mediaType, fetchedData)
+	default:
+		return gatewayruntime.Attachment{}, fmt.Errorf("%w: attachment must include data, text, or url", errInvalidCopilotAttachment)
+	}
+}
+
+func (s *Server) fetchRemoteAttachment(ctx context.Context, rawURL string) (string, []byte, string, error) {
+	parsed, err := url.Parse(strings.TrimSpace(rawURL))
+	if err != nil {
+		return "", nil, "", fmt.Errorf("%w: %v", errInvalidCopilotAttachment, err)
+	}
+	if err := validateRemoteAttachmentURL(parsed, s.cfg.AllowPrivateRemoteURLs); err != nil {
+		return "", nil, "", err
 	}
 
-	return attachments, cleanup, nil
+	request, err := http.NewRequestWithContext(ctx, http.MethodGet, parsed.String(), nil)
+	if err != nil {
+		return "", nil, "", fmt.Errorf("%w: %v", errInvalidCopilotAttachment, err)
+	}
+	response, err := newRemoteFetchClient(s.cfg.AllowPrivateRemoteURLs).Do(request)
+	if err != nil {
+		return "", nil, "", err
+	}
+	defer response.Body.Close()
+	if response.StatusCode < 200 || response.StatusCode >= 300 {
+		return "", nil, "", fmt.Errorf("%w: unexpected status %d", errInvalidCopilotAttachment, response.StatusCode)
+	}
+
+	limited := io.LimitReader(response.Body, s.cfg.MaxBodyBytes+1)
+	data, err := io.ReadAll(limited)
+	if err != nil {
+		return "", nil, "", err
+	}
+	if int64(len(data)) > s.cfg.MaxBodyBytes {
+		return "", nil, "", fmt.Errorf("%w: remote attachment exceeds max body size", errInvalidCopilotAttachment)
+	}
+	mediaType := strings.ToLower(strings.TrimSpace(response.Header.Get("Content-Type")))
+	if mediaType != "" {
+		mediaType, _, _ = strings.Cut(mediaType, ";")
+	}
+	if mediaType == "" {
+		mediaType = strings.ToLower(strings.TrimSpace(http.DetectContentType(data)))
+	}
+	nameHint := path.Base(parsed.Path)
+	if nameHint == "." || nameHint == "/" || strings.TrimSpace(nameHint) == "" {
+		nameHint = "attachment"
+	}
+	return mediaType, data, nameHint, nil
+}
+
+func newRemoteFetchClient(allowPrivate bool) *http.Client {
+	transport := http.DefaultTransport.(*http.Transport).Clone()
+	transport.Proxy = nil
+	dialer := &net.Dialer{}
+	transport.DialContext = func(ctx context.Context, network, address string) (net.Conn, error) {
+		host, port, err := net.SplitHostPort(address)
+		if err != nil {
+			return nil, err
+		}
+		resolved, err := net.DefaultResolver.LookupIP(ctx, "ip", host)
+		if err != nil {
+			return nil, err
+		}
+		var blocked int
+		for _, ip := range resolved {
+			if !allowPrivate {
+				if err := validateRemoteAttachmentIP(ip); err != nil {
+					blocked++
+					continue
+				}
+			}
+			conn, err := dialer.DialContext(ctx, network, net.JoinHostPort(ip.String(), port))
+			if err == nil {
+				return conn, nil
+			}
+		}
+		if blocked == len(resolved) && blocked > 0 {
+			return nil, fmt.Errorf("%w: private or special-use remote URLs are disabled", errInvalidCopilotAttachment)
+		}
+		return nil, fmt.Errorf("%w: unable to connect to remote attachment host", errInvalidCopilotAttachment)
+	}
+	return &http.Client{
+		Transport: transport,
+		CheckRedirect: func(req *http.Request, via []*http.Request) error {
+			if len(via) >= 10 {
+				return errors.New("stopped after 10 redirects")
+			}
+			return validateRemoteAttachmentURL(req.URL, allowPrivate)
+		},
+	}
+}
+
+func validateRemoteAttachmentURL(parsed *url.URL, allowPrivate bool) error {
+	if parsed == nil {
+		return fmt.Errorf("%w: remote URL is required", errInvalidCopilotAttachment)
+	}
+	if parsed.Scheme != "http" && parsed.Scheme != "https" {
+		return fmt.Errorf("%w: unsupported URL scheme %s", errInvalidCopilotAttachment, parsed.Scheme)
+	}
+	hostname := strings.TrimSpace(parsed.Hostname())
+	if hostname == "" {
+		return fmt.Errorf("%w: remote URL host is required", errInvalidCopilotAttachment)
+	}
+	if allowPrivate {
+		return nil
+	}
+	if isLocalhostHostname(hostname) {
+		return fmt.Errorf("%w: private or special-use remote URLs are disabled", errInvalidCopilotAttachment)
+	}
+	if ip := net.ParseIP(hostname); ip != nil {
+		return validateRemoteAttachmentIP(ip)
+	}
+	return nil
+}
+
+func validateRemoteAttachmentIP(ip net.IP) error {
+	if ip == nil {
+		return fmt.Errorf("%w: invalid remote IP address", errInvalidCopilotAttachment)
+	}
+	addr, ok := netip.AddrFromSlice(ip)
+	if !ok {
+		return fmt.Errorf("%w: invalid remote IP address", errInvalidCopilotAttachment)
+	}
+	addr = addr.Unmap()
+	if !addr.IsValid() || !addr.IsGlobalUnicast() {
+		return fmt.Errorf("%w: private or special-use remote URLs are disabled", errInvalidCopilotAttachment)
+	}
+	for _, prefix := range blockedRemoteIPPrefixes {
+		if prefix.Contains(addr) {
+			return fmt.Errorf("%w: private or special-use remote URLs are disabled", errInvalidCopilotAttachment)
+		}
+	}
+	return nil
+}
+
+func isLocalhostHostname(host string) bool {
+	host = strings.ToLower(strings.TrimSpace(host))
+	return host == "localhost" || strings.HasSuffix(host, ".localhost")
+}
+
+func mustParsePrefix(raw string) netip.Prefix {
+	prefix, err := netip.ParsePrefix(raw)
+	if err != nil {
+		panic(err)
+	}
+	return prefix
+}
+
+func writeAttachmentFile(dir, nameHint, mediaType string, data []byte) (gatewayruntime.Attachment, error) {
+	if len(data) == 0 {
+		return gatewayruntime.Attachment{}, fmt.Errorf("%w: attachment content must not be empty", errInvalidCopilotAttachment)
+	}
+	if strings.TrimSpace(mediaType) == "" {
+		mediaType = strings.ToLower(strings.TrimSpace(http.DetectContentType(data)))
+	}
+	pattern := sanitizeAttachmentName(nameHint) + "-*" + extensionForMediaType(mediaType)
+	file, err := os.CreateTemp(dir, pattern)
+	if err != nil {
+		return gatewayruntime.Attachment{}, err
+	}
+	if _, err := file.Write(data); err != nil {
+		name := file.Name()
+		_ = file.Close()
+		_ = os.Remove(name)
+		return gatewayruntime.Attachment{}, err
+	}
+	if err := file.Close(); err != nil {
+		name := file.Name()
+		_ = os.Remove(name)
+		return gatewayruntime.Attachment{}, err
+	}
+	return gatewayruntime.Attachment{
+		Path:      file.Name(),
+		MediaType: mediaType,
+	}, nil
+}
+
+func (s *Server) validateMaterializedImageAttachments(ctx context.Context, modelID string, attachments []gatewayruntime.Attachment) error {
+	if len(attachments) == 0 {
+		return nil
+	}
+	model, err := s.lookupModel(ctx, modelID)
+	if err != nil || model == nil || model.Limits.Vision == nil {
+		return err
+	}
+	if len(model.Limits.Vision.SupportedMediaTypes) > 0 {
+		allowed := make(map[string]struct{}, len(model.Limits.Vision.SupportedMediaTypes))
+		for _, mediaType := range model.Limits.Vision.SupportedMediaTypes {
+			allowed[strings.ToLower(strings.TrimSpace(mediaType))] = struct{}{}
+		}
+		for _, attachment := range attachments {
+			if _, ok := allowed[strings.ToLower(strings.TrimSpace(attachment.MediaType))]; !ok {
+				return fmt.Errorf("%w: unsupported media type %s", errModelLimitsExceeded, attachment.MediaType)
+			}
+		}
+	}
+	if limit := model.Limits.Vision.MaxPromptImageSize; limit > 0 {
+		for _, attachment := range attachments {
+			info, err := os.Stat(attachment.Path)
+			if err != nil {
+				return err
+			}
+			if info.Size() > int64(limit) {
+				return fmt.Errorf("%w: image exceeds max_prompt_image_size", errModelLimitsExceeded)
+			}
+		}
+	}
+	return nil
+}
+
+func combineCleanup(cleanups ...func() error) func() error {
+	filtered := make([]func() error, 0, len(cleanups))
+	for _, cleanup := range cleanups {
+		if cleanup != nil {
+			filtered = append(filtered, cleanup)
+		}
+	}
+	if len(filtered) == 0 {
+		return nil
+	}
+	return func() error {
+		var firstErr error
+		for _, cleanup := range filtered {
+			if err := cleanup(); err != nil && firstErr == nil {
+				firstErr = err
+			}
+		}
+		return firstErr
+	}
+}
+
+func sanitizeAttachmentName(name string) string {
+	name = strings.TrimSpace(name)
+	if name == "" {
+		return "attachment"
+	}
+	name = filepath.Base(name)
+	name = strings.TrimSuffix(name, filepath.Ext(name))
+	name = strings.Map(func(r rune) rune {
+		switch {
+		case r >= 'a' && r <= 'z':
+			return r
+		case r >= 'A' && r <= 'Z':
+			return r
+		case r >= '0' && r <= '9':
+			return r
+		case r == '-', r == '_':
+			return r
+		default:
+			return '-'
+		}
+	}, name)
+	name = strings.Trim(name, "-")
+	if name == "" {
+		return "attachment"
+	}
+	return name
 }
 
 func extensionForMediaType(mediaType string) string {
@@ -1105,6 +1625,14 @@ func extensionForMediaType(mediaType string) string {
 		return ".gif"
 	case "image/webp":
 		return ".webp"
+	case "text/plain":
+		return ".txt"
+	case "text/markdown":
+		return ".md"
+	case "application/json":
+		return ".json"
+	case "application/pdf":
+		return ".pdf"
 	default:
 		return ".bin"
 	}
@@ -1131,34 +1659,50 @@ func newIdleContext(parent context.Context, idle time.Duration) (context.Context
 		return ctx, cancel, func() {}
 	}
 
-	timer := time.NewTimer(idle)
+	var lastActivity atomic.Int64
+	lastActivity.Store(time.Now().UnixNano())
+	touchCh := make(chan struct{}, 1)
 	go func() {
-		select {
-		case <-timer.C:
-			cancel(errStreamIdleTimeout)
-		case <-ctx.Done():
+		timer := time.NewTimer(idle)
+		defer timer.Stop()
+		for {
+			select {
+			case <-ctx.Done():
+				return
+			case <-touchCh:
+				if !timer.Stop() {
+					select {
+					case <-timer.C:
+					default:
+					}
+				}
+				deadline := time.Unix(0, lastActivity.Load()).Add(idle)
+				wait := time.Until(deadline)
+				if wait <= 0 {
+					wait = idle
+				}
+				timer.Reset(wait)
+			case <-timer.C:
+				deadline := time.Unix(0, lastActivity.Load()).Add(idle)
+				if remaining := time.Until(deadline); remaining > 0 {
+					timer.Reset(remaining)
+					continue
+				}
+				cancel(errStreamIdleTimeout)
+				return
+			}
 		}
 	}()
 
 	touch := func() {
-		if !timer.Stop() {
-			select {
-			case <-timer.C:
-			default:
-			}
+		lastActivity.Store(time.Now().UnixNano())
+		select {
+		case touchCh <- struct{}{}:
+		default:
 		}
-		timer.Reset(idle)
 	}
 
-	return ctx, func(err error) {
-		if !timer.Stop() {
-			select {
-			case <-timer.C:
-			default:
-			}
-		}
-		cancel(err)
-	}, touch
+	return ctx, cancel, touch
 }
 
 func isJSONDecodeError(err error) bool {

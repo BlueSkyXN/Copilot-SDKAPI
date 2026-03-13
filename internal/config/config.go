@@ -4,6 +4,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"os"
+	"path/filepath"
 	"strconv"
 	"strings"
 	"time"
@@ -24,31 +25,33 @@ const (
 )
 
 type Config struct {
-	ListenAddr          string
-	DefaultModel        string
-	WorkingDirectory    string
-	ConfigDir           string
-	RequestTimeout      time.Duration
-	SessionTTL          time.Duration
-	StreamIdleTimeout   time.Duration
-	LogLevel            string
-	ClientName          string
-	CLIPath             string
-	GitHubToken         string
-	UseLoggedInUser     bool
-	MaxBodyBytes        int64
-	MaxActiveSessions   int
-	MaxSessionsPerKey   int
-	SDKAvailableTools   []string
-	SDKExcludedTools    []string
-	SDKSkillDirs        []string
-	SDKDisabledSkills   []string
-	SDKMCPServers       map[string]map[string]any
-	SDKCustomAgents     []gatewayruntime.CustomAgent
-	SDKDefaultAgent     string
-	SDKPermissionMode   gatewayruntime.PermissionMode
-	SDKInfiniteSessions *gatewayruntime.InfiniteSessionOptions
-	APIKeys             []APIKey
+	ListenAddr             string
+	DefaultModel           string
+	WorkingDirectory       string
+	ConfigDir              string
+	SessionStorePath       string
+	RequestTimeout         time.Duration
+	SessionTTL             time.Duration
+	StreamIdleTimeout      time.Duration
+	LogLevel               string
+	ClientName             string
+	CLIPath                string
+	GitHubToken            string
+	UseLoggedInUser        bool
+	MaxBodyBytes           int64
+	AllowPrivateRemoteURLs bool
+	MaxActiveSessions      int
+	MaxSessionsPerKey      int
+	SDKAvailableTools      []string
+	SDKExcludedTools       []string
+	SDKSkillDirs           []string
+	SDKDisabledSkills      []string
+	SDKMCPServers          map[string]map[string]any
+	SDKCustomAgents        []gatewayruntime.CustomAgent
+	SDKDefaultAgent        string
+	SDKPermissionMode      gatewayruntime.PermissionMode
+	SDKInfiniteSessions    *gatewayruntime.InfiniteSessionOptions
+	APIKeys                []APIKey
 }
 
 type APIKey struct {
@@ -63,18 +66,20 @@ func Load() (Config, error) {
 	}
 
 	cfg := Config{
-		ListenAddr:        defaultListenAddr,
-		DefaultModel:      defaultModel,
-		WorkingDirectory:  wd,
-		RequestTimeout:    defaultStreamIdleTimout,
-		SessionTTL:        defaultSessionTTL,
-		StreamIdleTimeout: defaultStreamIdleTimout,
-		LogLevel:          defaultLogLevel,
-		ClientName:        defaultClientName,
-		MaxBodyBytes:      defaultMaxBodyBytes,
-		MaxActiveSessions: defaultMaxActiveSessions,
-		MaxSessionsPerKey: defaultMaxSessionsPerKey,
-		SDKPermissionMode: gatewayruntime.PermissionModeDeny,
+		ListenAddr:             defaultListenAddr,
+		DefaultModel:           defaultModel,
+		WorkingDirectory:       wd,
+		SessionStorePath:       defaultSessionStorePath(),
+		RequestTimeout:         defaultStreamIdleTimout,
+		SessionTTL:             defaultSessionTTL,
+		StreamIdleTimeout:      defaultStreamIdleTimout,
+		LogLevel:               defaultLogLevel,
+		ClientName:             defaultClientName,
+		MaxBodyBytes:           defaultMaxBodyBytes,
+		AllowPrivateRemoteURLs: false,
+		MaxActiveSessions:      defaultMaxActiveSessions,
+		MaxSessionsPerKey:      defaultMaxSessionsPerKey,
+		SDKPermissionMode:      gatewayruntime.PermissionModeDeny,
 	}
 
 	if value := strings.TrimSpace(os.Getenv("GATEWAY_LISTEN_ADDR")); value != "" {
@@ -88,6 +93,9 @@ func Load() (Config, error) {
 	}
 	if value := strings.TrimSpace(os.Getenv("GATEWAY_CONFIG_DIR")); value != "" {
 		cfg.ConfigDir = value
+	}
+	if value := strings.TrimSpace(os.Getenv("GATEWAY_SESSION_STORE_PATH")); value != "" {
+		cfg.SessionStorePath = value
 	}
 	if value := strings.TrimSpace(os.Getenv("GATEWAY_LOG_LEVEL")); value != "" {
 		cfg.LogLevel = value
@@ -135,6 +143,13 @@ func Load() (Config, error) {
 			return Config{}, fmt.Errorf("parse GATEWAY_MAX_BODY_BYTES: %w", parseErr)
 		}
 		cfg.MaxBodyBytes = parsed
+	}
+	if value := strings.TrimSpace(os.Getenv("GATEWAY_ALLOW_PRIVATE_REMOTE_URLS")); value != "" {
+		parsed, parseErr := strconv.ParseBool(value)
+		if parseErr != nil {
+			return Config{}, fmt.Errorf("parse GATEWAY_ALLOW_PRIVATE_REMOTE_URLS: %w", parseErr)
+		}
+		cfg.AllowPrivateRemoteURLs = parsed
 	}
 	if value := strings.TrimSpace(os.Getenv("GATEWAY_MAX_ACTIVE_SESSIONS")); value != "" {
 		parsed, parseErr := strconv.Atoi(value)
@@ -238,6 +253,8 @@ func parsePermissionMode(raw string) (gatewayruntime.PermissionMode, error) {
 	switch strings.ToLower(strings.TrimSpace(raw)) {
 	case "", string(gatewayruntime.PermissionModeDeny):
 		return gatewayruntime.PermissionModeDeny, nil
+	case string(gatewayruntime.PermissionModeBridge):
+		return gatewayruntime.PermissionModeBridge, nil
 	case string(gatewayruntime.PermissionModeAllow):
 		return gatewayruntime.PermissionModeAllow, nil
 	default:
@@ -289,6 +306,14 @@ func parseThreshold(raw string) (float64, error) {
 		return 0, fmt.Errorf("threshold must be between 0 and 1")
 	}
 	return parsed, nil
+}
+
+func defaultSessionStorePath() string {
+	baseDir, err := os.UserConfigDir()
+	if err != nil || strings.TrimSpace(baseDir) == "" {
+		baseDir = os.TempDir()
+	}
+	return filepath.Join(baseDir, "copilot-sdkapi", "sessions.json")
 }
 
 func validateCustomAgents(agents []gatewayruntime.CustomAgent, defaultAgent string) error {

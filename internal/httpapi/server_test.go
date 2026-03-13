@@ -3,12 +3,15 @@ package httpapi
 import (
 	"bytes"
 	"context"
+	"encoding/base64"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"io"
 	"log/slog"
 	"net/http"
 	"net/http/httptest"
+	"net/url"
 	"os"
 	"strings"
 	"sync"
@@ -23,6 +26,15 @@ import (
 )
 
 const tinyPNGBase64 = "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR4nGP4z8DwHwAFAAH/iZk9HQAAAABJRU5ErkJggg=="
+
+func decodeTinyPNG(t *testing.T) []byte {
+	t.Helper()
+	decoded, err := base64.StdEncoding.DecodeString(tinyPNGBase64)
+	if err != nil {
+		t.Fatalf("decode tiny png: %v", err)
+	}
+	return decoded
+}
 
 func TestHandleOpenAIChatCompletionsJSON(t *testing.T) {
 	provider := &fakeProvider{
@@ -226,6 +238,524 @@ func TestSessionReuseUsesLatestUserPrompt(t *testing.T) {
 	}
 	if prompts[1] != "Explain it" {
 		t.Fatalf("expected reused session to send latest user prompt, got %q", prompts[1])
+	}
+}
+
+func TestSessionReuseResumesAcrossServerRestart(t *testing.T) {
+	storePath := t.TempDir() + "/sessions.json"
+	provider := &fakeProvider{
+		nextSession: &fakeSession{response: "First answer"},
+	}
+
+	firstServer := newTestServerWithConfig(t, provider, func(cfg *config.Config) {
+		cfg.SessionStorePath = storePath
+	})
+
+	first := `{"model":"gpt-4.1","messages":[{"role":"user","content":"Hello"},{"role":"assistant","content":"Hi!"},{"role":"user","content":"Tell me a joke"}]}`
+	firstRecorder := performRequest(firstServer, http.MethodPost, "/v1/chat/completions", first, map[string]string{
+		"Authorization": "Bearer test-key",
+		"X-Session-ID":  "session-key",
+	})
+	if firstRecorder.Code != http.StatusOK {
+		t.Fatalf("expected first request to succeed, got %d", firstRecorder.Code)
+	}
+
+	secondServer := newTestServerWithConfig(t, provider, func(cfg *config.Config) {
+		cfg.SessionStorePath = storePath
+	})
+
+	second := `{"model":"gpt-4.1","messages":[{"role":"user","content":"Hello"},{"role":"assistant","content":"Hi!"},{"role":"user","content":"Tell me a joke"},{"role":"assistant","content":"Why did the model cross the road?"},{"role":"user","content":"Explain it"}]}`
+	secondRecorder := performRequest(secondServer, http.MethodPost, "/v1/chat/completions", second, map[string]string{
+		"Authorization": "Bearer test-key",
+		"X-Session-ID":  "session-key",
+	})
+	if secondRecorder.Code != http.StatusOK {
+		t.Fatalf("expected resumed request to succeed, got %d", secondRecorder.Code)
+	}
+
+	if len(provider.createdSessions) != 1 {
+		t.Fatalf("expected only one session creation across restart, got %d", len(provider.createdSessions))
+	}
+	if len(provider.resumedSessions) != 1 {
+		t.Fatalf("expected one resumed session across restart, got %d", len(provider.resumedSessions))
+	}
+	prompts := provider.createdSessions[0].prompts
+	if len(prompts) != 2 {
+		t.Fatalf("expected 2 prompts after restart resume, got %d", len(prompts))
+	}
+	if prompts[1] != "Explain it" {
+		t.Fatalf("expected resumed session to send latest user prompt, got %q", prompts[1])
+	}
+}
+
+func TestInteractiveCopilotFlowRequiresStreaming(t *testing.T) {
+	server := newTestServer(t, &fakeProvider{})
+	body := `{"model":"gpt-4.1","messages":[{"role":"user","content":"Hello"}],"x_copilot":{"interactive":true}}`
+	recorder := performRequest(server, http.MethodPost, "/v1/chat/completions", body, map[string]string{
+		"Authorization": "Bearer test-key",
+		"X-Session-ID":  "interactive-session",
+	})
+
+	if recorder.Code != http.StatusBadRequest {
+		t.Fatalf("expected 400 for non-streaming interactive flow, got %d", recorder.Code)
+	}
+	if !strings.Contains(recorder.Body.String(), "stream=true") {
+		t.Fatalf("expected interactive validation error, got %s", recorder.Body.String())
+	}
+}
+
+func TestInteractiveCopilotFlowRequiresSessionID(t *testing.T) {
+	server := newTestServer(t, &fakeProvider{})
+	body := `{"model":"gpt-4.1","stream":true,"messages":[{"role":"user","content":"Hello"}],"x_copilot":{"interactive":true}}`
+	recorder := performRequest(server, http.MethodPost, "/v1/chat/completions", body, map[string]string{
+		"Authorization": "Bearer test-key",
+	})
+
+	if recorder.Code != http.StatusBadRequest {
+		t.Fatalf("expected 400 for interactive flow without X-Session-ID, got %d", recorder.Code)
+	}
+	if !strings.Contains(recorder.Body.String(), "X-Session-ID") {
+		t.Fatalf("expected missing session ID validation error, got %s", recorder.Body.String())
+	}
+}
+
+func TestPermissionBridgeRequiresSessionID(t *testing.T) {
+	server := newTestServerWithConfig(t, &fakeProvider{}, func(cfg *config.Config) {
+		cfg.SDKPermissionMode = gatewayruntime.PermissionModeBridge
+	})
+	body := `{"model":"gpt-4.1","stream":true,"messages":[{"role":"user","content":"Hello"}],"x_copilot":{"permission_mode":"bridge"}}`
+	recorder := performRequest(server, http.MethodPost, "/v1/chat/completions", body, map[string]string{
+		"Authorization": "Bearer test-key",
+	})
+
+	if recorder.Code != http.StatusBadRequest {
+		t.Fatalf("expected 400 for permission bridge without X-Session-ID, got %d", recorder.Code)
+	}
+	if !strings.Contains(recorder.Body.String(), "X-Session-ID") {
+		t.Fatalf("expected missing session ID validation error, got %s", recorder.Body.String())
+	}
+}
+
+func TestPermissionModeCannotEscalateBeyondServerPolicy(t *testing.T) {
+	server := newTestServer(t, &fakeProvider{})
+	body := `{"model":"gpt-4.1","stream":true,"messages":[{"role":"user","content":"Hello"}],"x_copilot":{"permission_mode":"allow"}}`
+	recorder := performRequest(server, http.MethodPost, "/v1/chat/completions", body, map[string]string{
+		"Authorization": "Bearer test-key",
+		"X-Session-ID":  "permission-key",
+	})
+
+	if recorder.Code != http.StatusBadRequest {
+		t.Fatalf("expected 400 for permission escalation, got %d: %s", recorder.Code, recorder.Body.String())
+	}
+	if !strings.Contains(recorder.Body.String(), "cannot exceed server permission policy") {
+		t.Fatalf("expected escalation validation error, got %s", recorder.Body.String())
+	}
+}
+
+func TestInteractiveToolBridgeStreamsPendingRequestAndResumes(t *testing.T) {
+	provider := &bridgeProvider{session: newBridgeSession("bridge-session")}
+	server := newTestServer(t, provider)
+	httpServer := httptest.NewServer(server.Handler())
+	defer httpServer.Close()
+
+	body := `{"model":"gpt-4.1","stream":true,"messages":[{"role":"user","content":"Use the tool"}],"x_copilot":{"interactive":true,"tools":[{"name":"lookup_issue","description":"Look up an issue","parameters":{"type":"object","properties":{"id":{"type":"string"}}}}]}}`
+	resultCh := make(chan string, 1)
+	errCh := make(chan error, 1)
+	go func() {
+		req, err := http.NewRequest(http.MethodPost, httpServer.URL+"/v1/chat/completions", bytes.NewBufferString(body))
+		if err != nil {
+			errCh <- err
+			return
+		}
+		req.Header.Set("Authorization", "Bearer test-key")
+		req.Header.Set("Content-Type", "application/json")
+		req.Header.Set("X-Session-ID", "bridge-key")
+		resp, err := http.DefaultClient.Do(req)
+		if err != nil {
+			errCh <- err
+			return
+		}
+		defer resp.Body.Close()
+		payload, err := io.ReadAll(resp.Body)
+		if err != nil {
+			errCh <- err
+			return
+		}
+		resultCh <- string(payload)
+	}()
+
+	select {
+	case <-provider.session.requested:
+	case <-time.After(5 * time.Second):
+		t.Fatal("timed out waiting for tool request")
+	}
+
+	continuation := `{"request_id":"req-1","kind":"tool_result","text_result":"Issue 123","result_type":"success"}`
+	request, err := http.NewRequest(http.MethodPost, httpServer.URL+"/v1/copilot/respond", bytes.NewBufferString(continuation))
+	if err != nil {
+		t.Fatalf("create continuation request: %v", err)
+	}
+	request.Header.Set("Authorization", "Bearer test-key")
+	request.Header.Set("Content-Type", "application/json")
+	request.Header.Set("X-Session-ID", "bridge-key")
+	response, err := http.DefaultClient.Do(request)
+	if err != nil {
+		t.Fatalf("send continuation request: %v", err)
+	}
+	defer response.Body.Close()
+	if response.StatusCode != http.StatusOK {
+		t.Fatalf("expected continuation to succeed, got %d", response.StatusCode)
+	}
+
+	select {
+	case err := <-errCh:
+		t.Fatalf("stream request failed: %v", err)
+	case payload := <-resultCh:
+		if !strings.Contains(payload, `"type":"external_tool_requested"`) {
+			t.Fatalf("expected stream to contain external tool request, got %s", payload)
+		}
+		if !strings.Contains(payload, `"request_id":"req-1"`) {
+			t.Fatalf("expected stream to contain request ID, got %s", payload)
+		}
+		if !strings.Contains(payload, `"Done after tool"`) {
+			t.Fatalf("expected stream to continue after continuation, got %s", payload)
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("timed out waiting for streamed response")
+	}
+
+	if len(provider.sessionOptions) != 1 {
+		t.Fatalf("expected one session options entry, got %d", len(provider.sessionOptions))
+	}
+	if !provider.sessionOptions[0].Interactive || len(provider.sessionOptions[0].Tools) != 1 || provider.sessionOptions[0].Tools[0].Name != "lookup_issue" {
+		t.Fatalf("unexpected session options %#v", provider.sessionOptions[0])
+	}
+}
+
+func TestPermissionBridgeStreamsPendingRequestAndResumes(t *testing.T) {
+	provider := &permissionBridgeProvider{session: newPermissionBridgeSession("permission-session")}
+	server := newTestServerWithConfig(t, provider, func(cfg *config.Config) {
+		cfg.SDKPermissionMode = gatewayruntime.PermissionModeBridge
+	})
+	httpServer := httptest.NewServer(server.Handler())
+	defer httpServer.Close()
+
+	body := `{"model":"gpt-4.1","stream":true,"messages":[{"role":"user","content":"Need approval"}],"x_copilot":{"permission_mode":"bridge"}}`
+	resultCh := make(chan string, 1)
+	errCh := make(chan error, 1)
+	go func() {
+		req, err := http.NewRequest(http.MethodPost, httpServer.URL+"/v1/chat/completions", bytes.NewBufferString(body))
+		if err != nil {
+			errCh <- err
+			return
+		}
+		req.Header.Set("Authorization", "Bearer test-key")
+		req.Header.Set("Content-Type", "application/json")
+		req.Header.Set("X-Session-ID", "permission-key")
+		resp, err := http.DefaultClient.Do(req)
+		if err != nil {
+			errCh <- err
+			return
+		}
+		defer resp.Body.Close()
+		payload, err := io.ReadAll(resp.Body)
+		if err != nil {
+			errCh <- err
+			return
+		}
+		resultCh <- string(payload)
+	}()
+
+	select {
+	case <-provider.session.requested:
+	case <-time.After(5 * time.Second):
+		t.Fatal("timed out waiting for permission request")
+	}
+
+	continuation := `{"request_id":"perm-1","kind":"permission_result","result_type":"approved"}`
+	request, err := http.NewRequest(http.MethodPost, httpServer.URL+"/v1/copilot/respond", bytes.NewBufferString(continuation))
+	if err != nil {
+		t.Fatalf("create continuation request: %v", err)
+	}
+	request.Header.Set("Authorization", "Bearer test-key")
+	request.Header.Set("Content-Type", "application/json")
+	request.Header.Set("X-Session-ID", "permission-key")
+	response, err := http.DefaultClient.Do(request)
+	if err != nil {
+		t.Fatalf("send continuation request: %v", err)
+	}
+	defer response.Body.Close()
+	if response.StatusCode != http.StatusOK {
+		t.Fatalf("expected continuation to succeed, got %d", response.StatusCode)
+	}
+
+	select {
+	case err := <-errCh:
+		t.Fatalf("stream request failed: %v", err)
+	case payload := <-resultCh:
+		if !strings.Contains(payload, `"type":"permission_requested"`) {
+			t.Fatalf("expected stream to contain permission request, got %s", payload)
+		}
+		if !strings.Contains(payload, `"request_id":"perm-1"`) {
+			t.Fatalf("expected stream to contain request ID, got %s", payload)
+		}
+		if !strings.Contains(payload, `"Done after permission"`) {
+			t.Fatalf("expected stream to continue after permission continuation, got %s", payload)
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("timed out waiting for streamed response")
+	}
+
+	if len(provider.sessionOptions) != 1 || provider.sessionOptions[0].PermissionMode != gatewayruntime.PermissionModeBridge {
+		t.Fatalf("unexpected session options %#v", provider.sessionOptions)
+	}
+}
+
+func TestContinuationRefreshesStreamIdleTimeout(t *testing.T) {
+	provider := &permissionBridgeProvider{session: &permissionBridgeSession{
+		id:                 "permission-session",
+		requested:          make(chan struct{}, 1),
+		responses:          make(chan gatewayruntime.PendingResponse, 1),
+		afterResponseDelay: 110 * time.Millisecond,
+	}}
+	server := newTestServerWithConfig(t, provider, func(cfg *config.Config) {
+		cfg.SDKPermissionMode = gatewayruntime.PermissionModeBridge
+		cfg.StreamIdleTimeout = 150 * time.Millisecond
+		cfg.RequestTimeout = 2 * time.Second
+	})
+	httpServer := httptest.NewServer(server.Handler())
+	defer httpServer.Close()
+
+	body := `{"model":"gpt-4.1","stream":true,"messages":[{"role":"user","content":"Need approval"}],"x_copilot":{"permission_mode":"bridge"}}`
+	resultCh := make(chan string, 1)
+	errCh := make(chan error, 1)
+	go func() {
+		req, err := http.NewRequest(http.MethodPost, httpServer.URL+"/v1/chat/completions", bytes.NewBufferString(body))
+		if err != nil {
+			errCh <- err
+			return
+		}
+		req.Header.Set("Authorization", "Bearer test-key")
+		req.Header.Set("Content-Type", "application/json")
+		req.Header.Set("X-Session-ID", "permission-key")
+		resp, err := http.DefaultClient.Do(req)
+		if err != nil {
+			errCh <- err
+			return
+		}
+		defer resp.Body.Close()
+		payload, err := io.ReadAll(resp.Body)
+		if err != nil {
+			errCh <- err
+			return
+		}
+		resultCh <- string(payload)
+	}()
+
+	select {
+	case <-provider.session.requested:
+	case <-time.After(5 * time.Second):
+		t.Fatal("timed out waiting for permission request")
+	}
+
+	time.Sleep(80 * time.Millisecond)
+
+	continuation := `{"request_id":"perm-1","kind":"permission_result","result_type":"approved"}`
+	request, err := http.NewRequest(http.MethodPost, httpServer.URL+"/v1/copilot/respond", bytes.NewBufferString(continuation))
+	if err != nil {
+		t.Fatalf("create continuation request: %v", err)
+	}
+	request.Header.Set("Authorization", "Bearer test-key")
+	request.Header.Set("Content-Type", "application/json")
+	request.Header.Set("X-Session-ID", "permission-key")
+	response, err := http.DefaultClient.Do(request)
+	if err != nil {
+		t.Fatalf("send continuation request: %v", err)
+	}
+	defer response.Body.Close()
+	if response.StatusCode != http.StatusOK {
+		t.Fatalf("expected continuation to succeed, got %d", response.StatusCode)
+	}
+
+	select {
+	case err := <-errCh:
+		t.Fatalf("stream request failed: %v", err)
+	case payload := <-resultCh:
+		if !strings.Contains(payload, `"Done after permission"`) {
+			t.Fatalf("expected stream to survive idle timeout after continuation, got %s", payload)
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("timed out waiting for streamed response")
+	}
+}
+
+func TestXCopilotAttachmentsAreMaterializedToSession(t *testing.T) {
+	provider := &fakeProvider{
+		nextSession: &fakeSession{
+			id:       "session-attachments",
+			response: "Attached",
+		},
+	}
+	server := newTestServer(t, provider)
+
+	body := `{"model":"gpt-4.1","messages":[{"role":"user","content":"Use the attached file"}],"x_copilot":{"attachments":[{"name":"notes.txt","text":"hello world","media_type":"text/plain"}]}}`
+	recorder := performRequest(server, http.MethodPost, "/v1/chat/completions", body, map[string]string{
+		"Authorization": "Bearer test-key",
+	})
+	if recorder.Code != http.StatusOK {
+		t.Fatalf("expected attachment request to succeed, got %d: %s", recorder.Code, recorder.Body.String())
+	}
+
+	if len(provider.createdSessions) != 1 || len(provider.createdSessions[0].attachments) != 1 || len(provider.createdSessions[0].attachments[0]) != 1 {
+		t.Fatalf("expected one materialized attachment, got %#v", provider.createdSessions)
+	}
+	attachment := provider.createdSessions[0].attachments[0][0]
+	content := provider.createdSessions[0].attachmentData[0][0]
+	if string(content) != "hello world" {
+		t.Fatalf("unexpected attachment contents %q", string(content))
+	}
+	if attachment.MediaType != "text/plain" {
+		t.Fatalf("unexpected attachment media type %q", attachment.MediaType)
+	}
+}
+
+func TestOpenAIImageURLIsFetchedAndMaterialized(t *testing.T) {
+	imageServer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "image/png")
+		w.WriteHeader(http.StatusOK)
+		_, _ = w.Write(decodeTinyPNG(t))
+	}))
+	defer imageServer.Close()
+
+	provider := &fakeProvider{
+		models: []gatewayruntime.Model{{
+			ID:   "gpt-4.1",
+			Name: "GPT-4.1",
+			Supports: gatewayruntime.ModelSupports{
+				Vision: true,
+			},
+			Limits: gatewayruntime.ModelLimits{
+				Vision: &gatewayruntime.ModelVisionLimits{
+					SupportedMediaTypes: []string{"image/png"},
+					MaxPromptImages:     4,
+					MaxPromptImageSize:  1 << 20,
+				},
+			},
+		}},
+		nextSession: &fakeSession{
+			id:       "session-image-url",
+			response: "Image ok",
+		},
+	}
+	server := newTestServerWithConfig(t, provider, func(cfg *config.Config) {
+		cfg.AllowPrivateRemoteURLs = true
+	})
+
+	body := fmt.Sprintf(`{"model":"gpt-4.1","messages":[{"role":"user","content":[{"type":"text","text":"What is in this image?"},{"type":"image_url","image_url":{"url":"%s/image.png"}}]}]}`, imageServer.URL)
+	recorder := performRequest(server, http.MethodPost, "/v1/chat/completions", body, map[string]string{
+		"Authorization": "Bearer test-key",
+	})
+	if recorder.Code != http.StatusOK {
+		t.Fatalf("expected remote image request to succeed, got %d: %s", recorder.Code, recorder.Body.String())
+	}
+
+	if len(provider.createdSessions) != 1 || len(provider.createdSessions[0].attachments) != 1 || len(provider.createdSessions[0].attachments[0]) != 1 {
+		t.Fatalf("expected one fetched image attachment, got %#v", provider.createdSessions)
+	}
+	attachment := provider.createdSessions[0].attachments[0][0]
+	if attachment.MediaType != "image/png" {
+		t.Fatalf("unexpected fetched image media type %q", attachment.MediaType)
+	}
+	content := provider.createdSessions[0].attachmentData[0][0]
+	if len(content) == 0 {
+		t.Fatal("expected fetched image content to be non-empty")
+	}
+}
+
+func TestOpenAIImageURLRejectsPrivateRemoteHostByDefault(t *testing.T) {
+	imageServer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "image/png")
+		w.WriteHeader(http.StatusOK)
+		_, _ = w.Write(decodeTinyPNG(t))
+	}))
+	defer imageServer.Close()
+
+	provider := &fakeProvider{
+		models: []gatewayruntime.Model{{
+			ID:   "gpt-4.1",
+			Name: "GPT-4.1",
+			Supports: gatewayruntime.ModelSupports{
+				Vision: true,
+			},
+			Limits: gatewayruntime.ModelLimits{
+				Vision: &gatewayruntime.ModelVisionLimits{
+					SupportedMediaTypes: []string{"image/png"},
+					MaxPromptImages:     4,
+					MaxPromptImageSize:  1 << 20,
+				},
+			},
+		}},
+		nextSession: &fakeSession{
+			id:       "session-image-url-private",
+			response: "Image blocked",
+		},
+	}
+	server := newTestServer(t, provider)
+
+	body := fmt.Sprintf(`{"model":"gpt-4.1","messages":[{"role":"user","content":[{"type":"text","text":"What is in this image?"},{"type":"image_url","image_url":{"url":"%s/image.png"}}]}]}`, imageServer.URL)
+	recorder := performRequest(server, http.MethodPost, "/v1/chat/completions", body, map[string]string{
+		"Authorization": "Bearer test-key",
+	})
+	if recorder.Code != http.StatusBadRequest {
+		t.Fatalf("expected private remote image URL to be rejected, got %d: %s", recorder.Code, recorder.Body.String())
+	}
+	if !strings.Contains(recorder.Body.String(), "private or special-use remote URLs are disabled") {
+		t.Fatalf("unexpected error body %s", recorder.Body.String())
+	}
+}
+
+func TestValidateRemoteAttachmentURLRejectsSpecialUseIPRanges(t *testing.T) {
+	for _, rawURL := range []string{
+		"http://100.64.0.1/demo.png",
+		"http://198.18.0.1/demo.png",
+		"http://192.0.2.1/demo.png",
+		"http://[2001:db8::1]/demo.png",
+	} {
+		parsed, err := url.Parse(rawURL)
+		if err != nil {
+			t.Fatalf("parse %q: %v", rawURL, err)
+		}
+		if err := validateRemoteAttachmentURL(parsed, false); err == nil {
+			t.Fatalf("expected %s to be rejected", rawURL)
+		}
+	}
+}
+
+func TestPersistentSessionRejectsToolConfigurationMismatch(t *testing.T) {
+	provider := &fakeProvider{
+		nextSession: &fakeSession{
+			id:       "session-tools",
+			response: "ok",
+		},
+	}
+	server := newTestServer(t, provider)
+
+	first := `{"model":"gpt-4.1","stream":true,"messages":[{"role":"user","content":"hello"}],"x_copilot":{"tools":[{"name":"lookup_issue","description":"Lookup issue","parameters":{"type":"object","properties":{"id":{"type":"string"}},"required":["id"]}}]}}`
+	firstResponse := performRequest(server, http.MethodPost, "/v1/chat/completions", first, map[string]string{
+		"Authorization": "Bearer test-key",
+		"X-Session-ID":  "tool-session",
+	})
+	if firstResponse.Code != http.StatusOK {
+		t.Fatalf("expected initial streaming request to succeed, got %d: %s", firstResponse.Code, firstResponse.Body.String())
+	}
+
+	second := `{"model":"gpt-4.1","stream":true,"messages":[{"role":"user","content":"hello again"}],"x_copilot":{"tools":[{"name":"lookup_pr","description":"Lookup pull request","parameters":{"type":"object","properties":{"id":{"type":"string"}},"required":["id"]}}]}}`
+	secondResponse := performRequest(server, http.MethodPost, "/v1/chat/completions", second, map[string]string{
+		"Authorization": "Bearer test-key",
+		"X-Session-ID":  "tool-session",
+	})
+	if secondResponse.Code != http.StatusConflict {
+		t.Fatalf("expected changed tool config to be rejected, got %d: %s", secondResponse.Code, secondResponse.Body.String())
 	}
 }
 
@@ -863,9 +1393,62 @@ type fakeProvider struct {
 	modelDelay      time.Duration
 	nextSession     *fakeSession
 	sequence        []*fakeSession
+	resumable       map[string]*fakeSession
 	createdSessions []*fakeSession
+	resumedSessions []string
+	deletedSessions []string
 	sessionOptions  []gatewayruntime.SessionOptions
 }
+
+type bridgeProvider struct {
+	session        *bridgeSession
+	sessionOptions []gatewayruntime.SessionOptions
+}
+
+type permissionBridgeProvider struct {
+	session        *permissionBridgeSession
+	sessionOptions []gatewayruntime.SessionOptions
+}
+
+func (p *bridgeProvider) Start(context.Context) error { return nil }
+func (p *bridgeProvider) Close() error                { return nil }
+
+func (p *bridgeProvider) ListModels(context.Context) ([]gatewayruntime.Model, error) {
+	return []gatewayruntime.Model{{ID: "gpt-4.1", Name: "GPT-4.1"}}, nil
+}
+
+func (p *bridgeProvider) NewSession(_ context.Context, options gatewayruntime.SessionOptions) (gatewayruntime.Session, error) {
+	p.sessionOptions = append(p.sessionOptions, options)
+	p.session.id = options.SessionID
+	return p.session, nil
+}
+
+func (p *bridgeProvider) ResumeSession(_ context.Context, _ string, options gatewayruntime.SessionOptions) (gatewayruntime.Session, error) {
+	p.sessionOptions = append(p.sessionOptions, options)
+	return p.session, nil
+}
+
+func (p *bridgeProvider) DeleteSession(context.Context, string) error { return nil }
+
+func (p *permissionBridgeProvider) Start(context.Context) error { return nil }
+func (p *permissionBridgeProvider) Close() error                { return nil }
+
+func (p *permissionBridgeProvider) ListModels(context.Context) ([]gatewayruntime.Model, error) {
+	return []gatewayruntime.Model{{ID: "gpt-4.1", Name: "GPT-4.1"}}, nil
+}
+
+func (p *permissionBridgeProvider) NewSession(_ context.Context, options gatewayruntime.SessionOptions) (gatewayruntime.Session, error) {
+	p.sessionOptions = append(p.sessionOptions, options)
+	p.session.id = options.SessionID
+	return p.session, nil
+}
+
+func (p *permissionBridgeProvider) ResumeSession(_ context.Context, _ string, options gatewayruntime.SessionOptions) (gatewayruntime.Session, error) {
+	p.sessionOptions = append(p.sessionOptions, options)
+	return p.session, nil
+}
+
+func (p *permissionBridgeProvider) DeleteSession(context.Context, string) error { return nil }
 
 func (p *fakeProvider) Start(context.Context) error { return nil }
 func (p *fakeProvider) Close() error                { return nil }
@@ -895,25 +1478,191 @@ func (p *fakeProvider) NewSession(_ context.Context, options gatewayruntime.Sess
 	default:
 		session = &fakeSession{id: "default-session", response: "ok"}
 	}
+	if options.SessionID != "" {
+		session.id = options.SessionID
+	}
 	p.sessionOptions = append(p.sessionOptions, options)
 	p.createdSessions = append(p.createdSessions, session)
+	if options.SessionID != "" {
+		if p.resumable == nil {
+			p.resumable = make(map[string]*fakeSession)
+		}
+		p.resumable[options.SessionID] = session
+	}
 	return session, nil
 }
 
+func (p *fakeProvider) ResumeSession(_ context.Context, sessionID string, options gatewayruntime.SessionOptions) (gatewayruntime.Session, error) {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+
+	p.sessionOptions = append(p.sessionOptions, options)
+	if p.resumable != nil {
+		if session, ok := p.resumable[sessionID]; ok {
+			p.resumedSessions = append(p.resumedSessions, sessionID)
+			return session, nil
+		}
+	}
+	return nil, gatewayruntime.ErrSessionNotFound
+}
+
+func (p *fakeProvider) DeleteSession(_ context.Context, sessionID string) error {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+
+	p.deletedSessions = append(p.deletedSessions, sessionID)
+	if p.resumable != nil {
+		delete(p.resumable, sessionID)
+	}
+	return nil
+}
+
 type fakeSession struct {
-	id            string
-	response      string
-	deltas        []string
-	reasoning     string
-	runtimeEvents []gatewayruntime.Event
-	usage         gatewayruntime.Usage
-	attachments   [][]gatewayruntime.Attachment
-	sendErr       error
+	id             string
+	response       string
+	deltas         []string
+	reasoning      string
+	runtimeEvents  []gatewayruntime.Event
+	usage          gatewayruntime.Usage
+	attachments    [][]gatewayruntime.Attachment
+	attachmentData [][][]byte
+	sendErr        error
 
 	mu         sync.Mutex
 	prompts    []string
 	closeCount int
 }
+
+type bridgeSession struct {
+	id        string
+	requested chan struct{}
+	responses chan gatewayruntime.PendingResponse
+}
+
+type permissionBridgeSession struct {
+	id                 string
+	requested          chan struct{}
+	responses          chan gatewayruntime.PendingResponse
+	afterResponseDelay time.Duration
+}
+
+func newBridgeSession(id string) *bridgeSession {
+	return &bridgeSession{
+		id:        id,
+		requested: make(chan struct{}, 1),
+		responses: make(chan gatewayruntime.PendingResponse, 1),
+	}
+}
+
+func newPermissionBridgeSession(id string) *permissionBridgeSession {
+	return &permissionBridgeSession{
+		id:        id,
+		requested: make(chan struct{}, 1),
+		responses: make(chan gatewayruntime.PendingResponse, 1),
+	}
+}
+
+func (s *bridgeSession) ID() string { return s.id }
+
+func (s *bridgeSession) Send(ctx context.Context, _ gatewayruntime.MessageOptions, handler gatewayruntime.EventHandler) (gatewayruntime.Result, error) {
+	if handler != nil {
+		if err := handler(gatewayruntime.Event{Type: gatewayruntime.EventExternalToolRequested, Runtime: &gatewayruntime.RuntimeEvent{
+			Type:      string(gatewayruntime.EventExternalToolRequested),
+			RequestID: "req-1",
+			CallID:    "call-1",
+			ToolName:  "lookup_issue",
+			Arguments: map[string]any{"id": "123"},
+		}}); err != nil {
+			return gatewayruntime.Result{}, err
+		}
+	}
+	select {
+	case s.requested <- struct{}{}:
+	default:
+	}
+
+	var response gatewayruntime.PendingResponse
+	select {
+	case response = <-s.responses:
+	case <-ctx.Done():
+		return gatewayruntime.Result{}, ctx.Err()
+	}
+	if response.RequestID != "req-1" || response.ToolResult == nil || response.ToolResult.TextResult != "Issue 123" {
+		return gatewayruntime.Result{}, errors.New("unexpected continuation payload")
+	}
+	if handler != nil {
+		if err := handler(gatewayruntime.Event{Type: gatewayruntime.EventMessageDelta, Delta: "Done after tool"}); err != nil {
+			return gatewayruntime.Result{}, err
+		}
+	}
+	return gatewayruntime.Result{
+		SessionID: s.id,
+		Content:   "Done after tool",
+	}, nil
+}
+
+func (s *bridgeSession) ResolvePending(_ context.Context, response gatewayruntime.PendingResponse) error {
+	s.responses <- response
+	return nil
+}
+
+func (s *bridgeSession) Close() error { return nil }
+
+func (s *permissionBridgeSession) ID() string { return s.id }
+
+func (s *permissionBridgeSession) Send(ctx context.Context, _ gatewayruntime.MessageOptions, handler gatewayruntime.EventHandler) (gatewayruntime.Result, error) {
+	if handler != nil {
+		if err := handler(gatewayruntime.Event{Type: gatewayruntime.EventPermissionRequested, Runtime: &gatewayruntime.RuntimeEvent{
+			Type:      string(gatewayruntime.EventPermissionRequested),
+			RequestID: "perm-1",
+			CallID:    "call-1",
+			PermissionRequest: &gatewayruntime.PermissionRequestSummary{
+				Kind:      "shell",
+				Intention: "Run approval-gated command",
+				Commands:  []string{"bash"},
+			},
+		}}); err != nil {
+			return gatewayruntime.Result{}, err
+		}
+	}
+	select {
+	case s.requested <- struct{}{}:
+	default:
+	}
+
+	var response gatewayruntime.PendingResponse
+	select {
+	case response = <-s.responses:
+	case <-ctx.Done():
+		return gatewayruntime.Result{}, ctx.Err()
+	}
+	if response.RequestID != "perm-1" || response.Permission == nil || response.Permission.ResultKind != "approved" {
+		return gatewayruntime.Result{}, errors.New("unexpected permission continuation payload")
+	}
+	if s.afterResponseDelay > 0 {
+		select {
+		case <-time.After(s.afterResponseDelay):
+		case <-ctx.Done():
+			return gatewayruntime.Result{}, ctx.Err()
+		}
+	}
+	if handler != nil {
+		if err := handler(gatewayruntime.Event{Type: gatewayruntime.EventMessageDelta, Delta: "Done after permission"}); err != nil {
+			return gatewayruntime.Result{}, err
+		}
+	}
+	return gatewayruntime.Result{
+		SessionID: s.id,
+		Content:   "Done after permission",
+	}, nil
+}
+
+func (s *permissionBridgeSession) ResolvePending(_ context.Context, response gatewayruntime.PendingResponse) error {
+	s.responses <- response
+	return nil
+}
+
+func (s *permissionBridgeSession) Close() error { return nil }
 
 func (s *fakeSession) ID() string { return s.id }
 
@@ -921,6 +1670,16 @@ func (s *fakeSession) Send(_ context.Context, message gatewayruntime.MessageOpti
 	s.mu.Lock()
 	s.prompts = append(s.prompts, message.Prompt)
 	s.attachments = append(s.attachments, append([]gatewayruntime.Attachment(nil), message.Attachments...))
+	payloads := make([][]byte, 0, len(message.Attachments))
+	for _, attachment := range message.Attachments {
+		data, err := os.ReadFile(attachment.Path)
+		if err != nil {
+			payloads = append(payloads, nil)
+			continue
+		}
+		payloads = append(payloads, data)
+	}
+	s.attachmentData = append(s.attachmentData, payloads)
 	s.mu.Unlock()
 
 	if s.response == "" {
@@ -959,6 +1718,10 @@ func (s *fakeSession) Send(_ context.Context, message gatewayruntime.MessageOpti
 	}, nil
 }
 
+func (s *fakeSession) ResolvePending(context.Context, gatewayruntime.PendingResponse) error {
+	return nil
+}
+
 func (s *fakeSession) Close() error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
@@ -976,6 +1739,7 @@ func newTestServerWithConfig(t *testing.T, provider gatewayruntime.Provider, mut
 		ListenAddr:        ":0",
 		DefaultModel:      "gpt-4.1",
 		WorkingDirectory:  t.TempDir(),
+		SessionStorePath:  t.TempDir() + "/sessions.json",
 		SessionTTL:        5 * time.Minute,
 		RequestTimeout:    5 * time.Second,
 		StreamIdleTimeout: 5 * time.Second,
@@ -995,10 +1759,10 @@ func newTestServerWithConfig(t *testing.T, provider gatewayruntime.Provider, mut
 		cfg,
 		auth.NewStore(cfg.APIKeys),
 		provider,
-		session.NewManagerWithLimits(cfg.SessionTTL, session.Limits{
+		session.NewManagerWithStore(cfg.SessionTTL, session.Limits{
 			MaxActiveSessions:     cfg.MaxActiveSessions,
 			MaxActivePerNamespace: cfg.MaxSessionsPerKey,
-		}),
+		}, session.NewFileStore(cfg.SessionStorePath)),
 		usage.NewRecorder(logger),
 		logger,
 	)

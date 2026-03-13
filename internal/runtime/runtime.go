@@ -1,12 +1,21 @@
 package runtime
 
-import "context"
+import (
+	"context"
+	"errors"
+)
+
+var ErrSessionNotFound = errors.New("runtime session not found")
+var ErrPendingRequestNotFound = errors.New("pending request not found")
+var ErrPendingRequestsUnsupported = errors.New("pending request continuation is not supported")
 
 type PermissionMode string
 
 const (
-	PermissionModeDeny  PermissionMode = "deny"
-	PermissionModeAllow PermissionMode = "allow"
+	PermissionModeDeny    PermissionMode = "deny"
+	PermissionModeAllow   PermissionMode = "allow"
+	PermissionModeBridge  PermissionMode = "bridge"
+	PermissionModeInherit PermissionMode = "inherit"
 )
 
 type InfiniteSessionOptions struct {
@@ -46,16 +55,79 @@ type Options struct {
 }
 
 type SessionOptions struct {
+	SessionID        string
 	Model            string
 	SystemPrompt     string
 	SystemPromptMode string
 	ReasoningEffort  string
 	Agent            string
+	Interactive      bool
+	Tools            []ToolDefinition
+	PermissionMode   PermissionMode
 }
 
 type Attachment struct {
 	Path      string
 	MediaType string
+}
+
+type ToolDefinition struct {
+	Name            string
+	Description     string
+	Parameters      map[string]any
+	OverrideBuiltIn bool
+}
+
+type ToolBinaryResult struct {
+	Data        string `json:"data"`
+	MIMEType    string `json:"mime_type,omitempty"`
+	Type        string `json:"type,omitempty"`
+	Description string `json:"description,omitempty"`
+}
+
+type ToolResult struct {
+	TextResult    string
+	BinaryResults []ToolBinaryResult
+	ResultType    string
+	SessionLog    string
+	Telemetry     map[string]any
+}
+
+type UserInputResponse struct {
+	Answer      string
+	WasFreeform bool
+}
+
+type PermissionResponse struct {
+	ResultKind string
+	Rules      []any
+}
+
+type PendingRequestKind string
+
+const (
+	PendingRequestTool       PendingRequestKind = "tool"
+	PendingRequestUserInput  PendingRequestKind = "user_input"
+	PendingRequestPermission PendingRequestKind = "permission"
+)
+
+type PendingRequest struct {
+	ID                string
+	Kind              PendingRequestKind
+	CallID            string
+	ToolName          string
+	Arguments         any
+	PermissionRequest *PermissionRequestSummary
+	UserInputRequest  *UserInputRequestSummary
+}
+
+type PendingResponse struct {
+	RequestID  string
+	Kind       PendingRequestKind
+	ToolResult *ToolResult
+	ToolError  string
+	UserInput  *UserInputResponse
+	Permission *PermissionResponse
 }
 
 type MessageOptions struct {
@@ -73,7 +145,9 @@ const (
 	EventToolExecutionStart        EventType = "tool_execution_start"
 	EventToolExecutionComplete     EventType = "tool_execution_complete"
 	EventPermissionRequested       EventType = "permission_requested"
+	EventPermissionCompleted       EventType = "permission_completed"
 	EventUserInputRequested        EventType = "user_input_requested"
+	EventExternalToolRequested     EventType = "external_tool_requested"
 	EventSessionCompactionStart    EventType = "session_compaction_start"
 	EventSessionCompactionComplete EventType = "session_compaction_complete"
 	EventSystemMessage             EventType = "system_message"
@@ -108,6 +182,7 @@ type RuntimeEvent struct {
 	Delta             string                    `json:"delta,omitempty"`
 	Role              string                    `json:"role,omitempty"`
 	Name              string                    `json:"name,omitempty"`
+	RequestID         string                    `json:"request_id,omitempty"`
 	CallID            string                    `json:"call_id,omitempty"`
 	ToolName          string                    `json:"tool_name,omitempty"`
 	MCPServerName     string                    `json:"mcp_server_name,omitempty"`
@@ -206,6 +281,7 @@ type ModelLimits struct {
 type Session interface {
 	ID() string
 	Send(ctx context.Context, message MessageOptions, handler EventHandler) (Result, error)
+	ResolvePending(ctx context.Context, response PendingResponse) error
 	Close() error
 }
 
@@ -214,4 +290,6 @@ type Provider interface {
 	Close() error
 	ListModels(ctx context.Context) ([]Model, error)
 	NewSession(ctx context.Context, options SessionOptions) (Session, error)
+	ResumeSession(ctx context.Context, sessionID string, options SessionOptions) (Session, error)
+	DeleteSession(ctx context.Context, sessionID string) error
 }

@@ -33,11 +33,30 @@ type Turn struct {
 	Attachments []ImageAttachment
 }
 
+type CopilotToolDefinition struct {
+	Name            string         `json:"name,omitempty"`
+	Description     string         `json:"description,omitempty"`
+	Parameters      map[string]any `json:"parameters,omitempty"`
+	OverrideBuiltIn bool           `json:"override_builtin,omitempty"`
+}
+
+type CopilotAttachment struct {
+	Name      string `json:"name,omitempty"`
+	MediaType string `json:"media_type,omitempty"`
+	Data      string `json:"data,omitempty"`
+	Text      string `json:"text,omitempty"`
+	URL       string `json:"url,omitempty"`
+}
+
 type CopilotRequestExtension struct {
-	Agent                string `json:"agent,omitempty"`
-	SystemMessageMode    string `json:"system_message_mode,omitempty"`
-	IncludeReasoning     bool   `json:"include_reasoning,omitempty"`
-	IncludeRuntimeEvents bool   `json:"include_runtime_events,omitempty"`
+	Agent                string                  `json:"agent,omitempty"`
+	SystemMessageMode    string                  `json:"system_message_mode,omitempty"`
+	IncludeReasoning     bool                    `json:"include_reasoning,omitempty"`
+	IncludeRuntimeEvents bool                    `json:"include_runtime_events,omitempty"`
+	Interactive          bool                    `json:"interactive,omitempty"`
+	PermissionMode       string                  `json:"permission_mode,omitempty"`
+	Tools                []CopilotToolDefinition `json:"tools,omitempty"`
+	Attachments          []CopilotAttachment     `json:"attachments,omitempty"`
 }
 
 type CopilotResponseExtension struct {
@@ -59,6 +78,7 @@ type ConversationRequest struct {
 type ImageAttachment struct {
 	MediaType string
 	Data      []byte
+	URL       string
 }
 
 func BuildPrompt(turns []Turn) string {
@@ -211,6 +231,9 @@ func parseOpenAIImage(entry map[string]any) (ImageAttachment, error) {
 	if !ok || strings.TrimSpace(rawURL) == "" {
 		return ImageAttachment{}, ErrInvalidImageData
 	}
+	if parsed, err := url.Parse(rawURL); err == nil && (parsed.Scheme == "http" || parsed.Scheme == "https") {
+		return ImageAttachment{URL: rawURL}, nil
+	}
 	return parseDataURLImage(rawURL)
 }
 
@@ -220,6 +243,16 @@ func parseClaudeImage(entry map[string]any) (ImageAttachment, error) {
 		return ImageAttachment{}, ErrInvalidImageData
 	}
 	sourceType, _ := source["type"].(string)
+	if sourceType == "url" {
+		rawURL, _ := source["url"].(string)
+		if strings.TrimSpace(rawURL) == "" {
+			return ImageAttachment{}, ErrInvalidImageData
+		}
+		if parsed, err := url.Parse(rawURL); err == nil && (parsed.Scheme == "http" || parsed.Scheme == "https") {
+			return ImageAttachment{URL: rawURL}, nil
+		}
+		return ImageAttachment{}, fmt.Errorf("%w: source type %s", ErrInvalidImageData, sourceType)
+	}
 	if sourceType != "base64" {
 		return ImageAttachment{}, fmt.Errorf("%w: source type %s", ErrInvalidImageData, sourceType)
 	}

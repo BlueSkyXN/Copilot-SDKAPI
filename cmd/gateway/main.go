@@ -58,10 +58,11 @@ func main() {
 	}
 
 	authStore := auth.NewStore(cfg.APIKeys)
-	sessionManager := session.NewManagerWithLimits(cfg.SessionTTL, session.Limits{
+	sessionStore := session.NewFileStore(cfg.SessionStorePath)
+	sessionManager := session.NewManagerWithStore(cfg.SessionTTL, session.Limits{
 		MaxActiveSessions:     cfg.MaxActiveSessions,
 		MaxActivePerNamespace: cfg.MaxSessionsPerKey,
-	})
+	}, sessionStore)
 	recorder := usage.NewRecorder(logger)
 	server := httpapi.NewServer(cfg, authStore, provider, sessionManager, recorder, logger)
 
@@ -85,7 +86,7 @@ func main() {
 	if err := httpServer.Shutdown(shutdownCtx); err != nil {
 		logger.Error("http shutdown failed", slog.Any("err", err))
 	}
-	if err := sessionManager.CloseContext(shutdownCtx); err != nil {
+	if err := sessionManager.DisconnectContext(shutdownCtx); err != nil {
 		logger.Error("session shutdown failed", slog.Any("err", err))
 	}
 	if err := closeWithContext(shutdownCtx, provider.Close); err != nil {

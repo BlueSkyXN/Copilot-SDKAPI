@@ -12,8 +12,10 @@ func TestLoadParsesConfiguration(t *testing.T) {
 	t.Setenv("GATEWAY_REQUEST_TIMEOUT", "3m")
 	t.Setenv("GATEWAY_STREAM_IDLE_TIMEOUT", "45s")
 	t.Setenv("GATEWAY_SESSION_TTL", "20m")
+	t.Setenv("GATEWAY_SESSION_STORE_PATH", "/tmp/copilot-sdkapi-test-sessions.json")
 	t.Setenv("GATEWAY_MAX_ACTIVE_SESSIONS", "123")
 	t.Setenv("GATEWAY_MAX_ACTIVE_SESSIONS_PER_KEY", "17")
+	t.Setenv("GATEWAY_ALLOW_PRIVATE_REMOTE_URLS", "true")
 	t.Setenv("GATEWAY_USE_LOGGED_IN_USER", "false")
 	t.Setenv("GATEWAY_SDK_AVAILABLE_TOOLS", "view,edit")
 	t.Setenv("GATEWAY_SDK_EXCLUDED_TOOLS", "shell")
@@ -47,6 +49,9 @@ func TestLoadParsesConfiguration(t *testing.T) {
 	if cfg.SessionTTL != 20*time.Minute {
 		t.Fatalf("unexpected session ttl %s", cfg.SessionTTL)
 	}
+	if cfg.SessionStorePath != "/tmp/copilot-sdkapi-test-sessions.json" {
+		t.Fatalf("unexpected session store path %q", cfg.SessionStorePath)
+	}
 	if cfg.UseLoggedInUser {
 		t.Fatalf("expected logged in user auth to be disabled")
 	}
@@ -55,6 +60,9 @@ func TestLoadParsesConfiguration(t *testing.T) {
 	}
 	if cfg.MaxSessionsPerKey != 17 {
 		t.Fatalf("unexpected max sessions per key %d", cfg.MaxSessionsPerKey)
+	}
+	if !cfg.AllowPrivateRemoteURLs {
+		t.Fatalf("expected private remote URLs to be enabled")
 	}
 	if len(cfg.APIKeys) != 2 {
 		t.Fatalf("expected 2 api keys, got %d", len(cfg.APIKeys))
@@ -82,5 +90,18 @@ func TestLoadParsesConfiguration(t *testing.T) {
 	}
 	if cfg.SDKInfiniteSessions == nil || cfg.SDKInfiniteSessions.Enabled == nil || *cfg.SDKInfiniteSessions.Enabled || cfg.SDKInfiniteSessions.BackgroundCompactionThreshold == nil || *cfg.SDKInfiniteSessions.BackgroundCompactionThreshold != 0.7 || cfg.SDKInfiniteSessions.BufferExhaustionThreshold == nil || *cfg.SDKInfiniteSessions.BufferExhaustionThreshold != 0.9 {
 		t.Fatalf("unexpected infinite session config %#v", cfg.SDKInfiniteSessions)
+	}
+}
+
+func TestLoadParsesBridgePermissionMode(t *testing.T) {
+	t.Setenv("GATEWAY_API_KEYS", "one=key1")
+	t.Setenv("GATEWAY_SDK_PERMISSION_MODE", "bridge")
+
+	cfg, err := Load()
+	if err != nil {
+		t.Fatalf("load config: %v", err)
+	}
+	if cfg.SDKPermissionMode != "bridge" {
+		t.Fatalf("unexpected permission mode %q", cfg.SDKPermissionMode)
 	}
 }
