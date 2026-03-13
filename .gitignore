@@ -1,0 +1,45 @@
+# OS / editor noise
+.DS_Store
+.idea/
+.vscode/
+*.swp
+*.swo
+*~
+
+# Local notes / scratch workspace files
+CLAUDE.md
+local/
+
+# Local environment files
+.env
+.env.*
+!.env.example
+!.env.sample
+
+# Go build artifacts
+/gateway
+/gateway.exe
+/bin/
+/dist/
+*.test
+*.exe
+*.dll
+*.so
+*.dylib
+
+# Go coverage / profiling outputs
+coverage.out
+cover.out
+*.coverprofile
+*.prof
+
+# Logs
+*.log
+
+# Generated embedded CLI artifacts (built in CI via bundler)
+internal/embeddedcli/zcopilot_*.zst
+internal/embeddedcli/zcopilot_*.license
+internal/embeddedcli/zcopilot_*_*.go
+
+# Go vendor directory (dependencies fetched via go mod download)
+vendor/
