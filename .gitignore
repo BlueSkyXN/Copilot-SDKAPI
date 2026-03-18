@@ -17,6 +17,8 @@ local/
 !.env.sample
 
 # Go build artifacts
+/copilot-sdkapi
+/copilot-sdkapi.exe
 /gateway
 /gateway.exe
 /bin/
