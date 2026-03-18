@@ -20,6 +20,9 @@ curl http://127.0.0.1:38095/v1/models \
 这里要特别注意：`/v1/models` 当前是**直接透传当前 Copilot SDK / CLI 运行时列出来的模型集合**，网关本身没有再做隐藏 allowlist，也没有额外补全 Web / LMAPI 上可能出现的其它模型 ID。  
 所以如果你发现某些网页端或其它入口可见的模型（例如某些 preview / internal / experiment 名称）没有出现在这里，差异通常来自**上游 SDK / CLI 的枚举结果**，不是这个网关在额外过滤。
 
+补充一点：当前如果你在请求体里**手动填写一个没出现在 `/v1/models` 的 model ID**，网关仍会把这个 ID 直接传给上游 SDK / CLI。  
+这意味着它有机会“先试再说”，但相应地，本地基于模型目录做的 reasoning / vision / image limit 预检通常也不会生效；最终能不能跑通，要看上游是否接受该模型 ID。
+
 ### 3. OpenAI 非流式
 
 ```bash
