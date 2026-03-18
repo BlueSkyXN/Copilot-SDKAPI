@@ -27,7 +27,7 @@
 | `GATEWAY_MAX_BODY_BYTES` | `1048576` | 请求体大小上限，单位字节。 |
 | `GATEWAY_MAX_ACTIVE_SESSIONS` | `256` | 进程内持久会话总上限。 |
 | `GATEWAY_MAX_ACTIVE_SESSIONS_PER_KEY` | `64` | 单个 API key 的持久会话上限。 |
-| `GATEWAY_LOG_LEVEL` | `error` | 日志级别。 |
+| `GATEWAY_LOG_LEVEL` | `error` | 日志级别。默认只输出错误；如果你希望首次启动时看到监听地址、默认试用 key 告警等提示，建议显式设为 `info`。 |
 | `GATEWAY_CLIENT_NAME` | `copilot-sdkapi` | 传给 SDK / CLI 的客户端标识。 |
 
 ## CLI 与认证解析

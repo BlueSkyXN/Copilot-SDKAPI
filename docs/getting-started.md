@@ -76,8 +76,11 @@ export GATEWAY_API_KEYS=test-key
 
 ### 第 3 步：启动网关
 
+首次试跑建议顺手打开 `info` 日志；否则默认日志级别是 `error`，程序正常启动时几乎不会输出任何提示，这看起来会像“没反应”，其实只是**安静启动**了。
+
 ```bash
 cd /Users/sky/Github/Copilot-SDKAPI
+export GATEWAY_LOG_LEVEL=info
 go run ./cmd/gateway
 ```
 
@@ -132,6 +135,7 @@ curl http://127.0.0.1:38095/v1/chat/completions \
 ```bash
 cd /Users/sky/Github/Copilot-SDKAPI
 GATEWAY_API_KEYS=test-key \
+GATEWAY_LOG_LEVEL=info \
 GATEWAY_DEFAULT_MODEL=gpt-4.1 \
 go run ./cmd/gateway
 ```
