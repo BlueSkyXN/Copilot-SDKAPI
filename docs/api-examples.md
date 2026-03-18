@@ -17,6 +17,9 @@ curl http://127.0.0.1:38095/v1/models \
 
 返回中的每个模型项除标准字段外，还会包含可忽略的 `x_copilot` 扩展元数据，例如 `supports.vision`、`supports.reasoning_effort`、`limits.max_context_window_tokens`、`supported_reasoning_efforts`。
 
+这里要特别注意：`/v1/models` 当前是**直接透传当前 Copilot SDK / CLI 运行时列出来的模型集合**，网关本身没有再做隐藏 allowlist，也没有额外补全 Web / LMAPI 上可能出现的其它模型 ID。  
+所以如果你发现某些网页端或其它入口可见的模型（例如某些 preview / internal / experiment 名称）没有出现在这里，差异通常来自**上游 SDK / CLI 的枚举结果**，不是这个网关在额外过滤。
+
 ### 3. OpenAI 非流式
 
 ```bash

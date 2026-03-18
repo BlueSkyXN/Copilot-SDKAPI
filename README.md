@@ -46,7 +46,7 @@
 - OpenAI Chat Completions 常见标准字段（如 `max_tokens`、`temperature`、`top_p`、`presence_penalty`、`frequency_penalty`、`response_format`、`metadata` 等）可宽容接受；当前无 SDK 对应能力时按 no-op 处理
 - OpenAI 标准 `tools` / `functions` 定义可桥接到现有 `x_copilot.tools` 运行时通道
 - 通过 `x_copilot` 扩展输出 reasoning 与运行时事件（tool / permission / compaction / agent 等）
-- `/v1/models` 返回可忽略的 `x_copilot` 扩展元数据，包含 vision / reasoning / limits
+- `/v1/models` 直接反映当前 Copilot SDK / CLI 运行时实际公开的模型列表，并附带可忽略的 `x_copilot` 扩展元数据（vision / reasoning / limits 等）
 - 基于 `X-Session-ID` 的持久会话复用，可跨网关重启恢复
 - 默认拒绝所有工具权限请求；服务端可显式配置为 `bridge` 或 `allow`，请求侧只能在该上限内选择更严格模式
 - 可通过环境变量接入 Copilot SDK 的 Skills / MCP / 工具白名单 / custom agents / infinite sessions 配置
@@ -59,6 +59,7 @@
 
 - OpenAI Chat Completions 的标准 `tools` / `functions` 字段现在会桥接到 `x_copilot.tools`；但真正发生 tool / ask_user / permission continuation 时，仍要求 `stream=true` + `X-Session-ID` + `/v1/copilot/respond`
 - OpenAI Chat Completions 的常见 generation / metadata 字段当前会被宽容接受；但 `n>1` 与音频输出（如 `modalities=["audio"]` / `audio`）仍会显式返回 `400 unsupported_feature`
+- `/v1/models` 当前只反映 SDK / CLI 运行时实际列出的模型；它不保证覆盖 Copilot Web、LMAPI 或其它前端入口里出现的全部模型 ID
 - reasoning / runtime events 当前通过 `x_copilot` 扩展暴露，不伪装成标准 OpenAI / Claude thinking 协议
 - OpenAI / Claude 图片输入当前只支持**最新一条用户消息**中的图片内容；更早轮次的图片会被拒绝，避免静默丢失
 - fresh session 下历史图片仍无法无损重建为原始多轮附件语义，因此不会静默接受更早轮次图片
