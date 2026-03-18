@@ -60,7 +60,7 @@
 - OpenAI Chat Completions 的标准 `tools` / `functions` 字段现在会桥接到 `x_copilot.tools`；但真正发生 tool / ask_user / permission continuation 时，仍要求 `stream=true` + `X-Session-ID` + `/v1/copilot/respond`
 - OpenAI Chat Completions 的常见 generation / metadata 字段当前会被宽容接受；但 `n>1` 与音频输出（如 `modalities=["audio"]` / `audio`）仍会显式返回 `400 unsupported_feature`
 - `/v1/models` 当前只反映 SDK / CLI 运行时实际列出的模型；它不保证覆盖 Copilot Web、LMAPI 或其它前端入口里出现的全部模型 ID
-- 当前也允许客户端手动传入未出现在 `/v1/models` 里的 model ID；这类 ID 会直接透传到上游 SDK / CLI，本地基于模型目录的 vision / reasoning / limit 预检通常不会生效，最终是否可用取决于上游
+- 当前仍允许客户端手动传入未出现在 `/v1/models` 里的 model ID；纯文本请求会直接透传到上游 SDK / CLI，但如果同时使用 `reasoning_effort` 或图片输入，网关会先返回 `400`，要求该模型必须先能在 `/v1/models` 中被识别
 - reasoning / runtime events 当前通过 `x_copilot` 扩展暴露，不伪装成标准 OpenAI / Claude thinking 协议
 - OpenAI / Claude 图片输入当前只支持**最新一条用户消息**中的图片内容；更早轮次的图片会被拒绝，避免静默丢失
 - fresh session 下历史图片仍无法无损重建为原始多轮附件语义，因此不会静默接受更早轮次图片

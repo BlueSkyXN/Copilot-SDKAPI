@@ -878,6 +878,41 @@ func TestOpenAIReasoningEffortFlowsToSession(t *testing.T) {
 	}
 }
 
+func TestUnknownModelPassesThroughWithoutCapabilityChecks(t *testing.T) {
+	provider := &fakeProvider{
+		nextSession: &fakeSession{id: "manual-model", response: "ok"},
+	}
+	server := newTestServer(t, provider)
+
+	recorder := performRequest(server, http.MethodPost, "/v1/chat/completions", `{"model":"gemini-hidden-preview","messages":[{"role":"user","content":"Hello"}]}`, map[string]string{
+		"Authorization": "Bearer test-key",
+	})
+	if recorder.Code != http.StatusOK {
+		t.Fatalf("expected 200 for unknown plain-text model, got %d: %s", recorder.Code, recorder.Body.String())
+	}
+	if len(provider.sessionOptions) != 1 || provider.sessionOptions[0].Model != "gemini-hidden-preview" {
+		t.Fatalf("expected manual model id to reach session options, got %#v", provider.sessionOptions)
+	}
+}
+
+func TestUnknownModelRejectsReasoningEffort(t *testing.T) {
+	provider := &fakeProvider{}
+	server := newTestServer(t, provider)
+
+	recorder := performRequest(server, http.MethodPost, "/v1/chat/completions", `{"model":"gemini-hidden-preview","reasoning_effort":"high","messages":[{"role":"user","content":"Hello"}]}`, map[string]string{
+		"Authorization": "Bearer test-key",
+	})
+	if recorder.Code != http.StatusBadRequest {
+		t.Fatalf("expected 400 for unknown model with reasoning effort, got %d: %s", recorder.Code, recorder.Body.String())
+	}
+	if !strings.Contains(recorder.Body.String(), "/v1/models") || !strings.Contains(recorder.Body.String(), "reasoning_effort") {
+		t.Fatalf("expected actionable unknown-model reasoning error, got %s", recorder.Body.String())
+	}
+	if len(provider.createdSessions) != 0 {
+		t.Fatalf("expected no session to be created for unknown reasoning model, got %#v", provider.createdSessions)
+	}
+}
+
 func TestOpenAIXCopilotExtensionsFlowToSessionAndResponse(t *testing.T) {
 	provider := &fakeProvider{
 		models: []gatewayruntime.Model{{
@@ -1098,6 +1133,25 @@ func TestImageInputRejectedForNonVisionModel(t *testing.T) {
 	})
 	if recorder.Code != http.StatusBadRequest {
 		t.Fatalf("expected 400 for non-vision model, got %d: %s", recorder.Code, recorder.Body.String())
+	}
+}
+
+func TestUnknownModelRejectsImageInput(t *testing.T) {
+	provider := &fakeProvider{}
+	server := newTestServer(t, provider)
+
+	body := `{"model":"gemini-hidden-preview","messages":[{"role":"user","content":[{"type":"image_url","image_url":{"url":"data:image/png;base64,` + tinyPNGBase64 + `"}}]}]}`
+	recorder := performRequest(server, http.MethodPost, "/v1/chat/completions", body, map[string]string{
+		"Authorization": "Bearer test-key",
+	})
+	if recorder.Code != http.StatusBadRequest {
+		t.Fatalf("expected 400 for unknown model with image input, got %d: %s", recorder.Code, recorder.Body.String())
+	}
+	if !strings.Contains(recorder.Body.String(), "/v1/models") || !strings.Contains(recorder.Body.String(), "image input") {
+		t.Fatalf("expected actionable unknown-model image error, got %s", recorder.Body.String())
+	}
+	if len(provider.createdSessions) != 0 {
+		t.Fatalf("expected no session to be created for unknown vision model, got %#v", provider.createdSessions)
 	}
 }
 

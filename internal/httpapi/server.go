@@ -38,6 +38,7 @@ var errInvalidAnthropicVersion = errors.New("unsupported anthropic-version heade
 var errUnsupportedReasoningEffort = errors.New("reasoning effort is not supported by the selected model")
 var errUnsupportedVisionModel = errors.New("image input is not supported by the selected model")
 var errModelLimitsExceeded = errors.New("request exceeds model capability limits")
+var errUnknownModelCapabilities = errors.New("requested model is not listed in /v1/models")
 var errInvalidSystemMessageMode = errors.New("unsupported x_copilot.system_message_mode")
 var errUnknownAgent = errors.New("unknown x_copilot.agent")
 var errInteractiveRequiresStream = errors.New("x_copilot continuation flows require stream=true")
@@ -896,7 +897,7 @@ func classifyError(err error) (int, string, string) {
 		return http.StatusBadRequest, "invalid_request_error", err.Error()
 	case errors.Is(err, errInteractiveRequiresStream), errors.Is(err, errInteractiveRequiresSessionKey), errors.Is(err, errInvalidCopilotPermissionMode), errors.Is(err, errCopilotPermissionEscalation), errors.Is(err, errInvalidCopilotTool), errors.Is(err, errInvalidCopilotResponse), errors.Is(err, errInvalidCopilotAttachment):
 		return http.StatusBadRequest, "invalid_request_error", err.Error()
-	case errors.Is(err, errUnsupportedReasoningEffort), errors.Is(err, errUnsupportedVisionModel), errors.Is(err, errModelLimitsExceeded):
+	case errors.Is(err, errUnsupportedReasoningEffort), errors.Is(err, errUnsupportedVisionModel), errors.Is(err, errModelLimitsExceeded), errors.Is(err, errUnknownModelCapabilities):
 		return http.StatusBadRequest, "invalid_request_error", err.Error()
 	case errors.Is(err, session.ErrSessionSpecMismatch):
 		return http.StatusConflict, "session_conflict", err.Error()
@@ -1046,8 +1047,11 @@ func (s *Server) validateConversationFeatures(ctx context.Context, modelID strin
 	}
 
 	model, err := s.lookupModel(ctx, modelID)
-	if err != nil || model == nil {
+	if err != nil {
 		return err
+	}
+	if model == nil {
+		return unknownModelCapabilitiesError(modelID, request.ReasoningEffort != "", attachmentCount(request.Turns) > 0)
 	}
 
 	if request.ReasoningEffort != "" {
@@ -1130,6 +1134,20 @@ func (s *Server) lookupModel(ctx context.Context, modelID string) (*gatewayrunti
 		}
 	}
 	return nil, nil
+}
+
+func unknownModelCapabilitiesError(modelID string, hasReasoning, hasImages bool) error {
+	features := make([]string, 0, 2)
+	if hasReasoning {
+		features = append(features, "reasoning_effort")
+	}
+	if hasImages {
+		features = append(features, "image input")
+	}
+	if len(features) == 0 {
+		return nil
+	}
+	return fmt.Errorf("%w: cannot validate %s for model %q; list the model in /v1/models first or retry without those features", errUnknownModelCapabilities, strings.Join(features, " and "), modelID)
 }
 
 func (s *Server) hasCustomAgent(agent string) bool {
@@ -1538,8 +1556,14 @@ func (s *Server) validateMaterializedImageAttachments(ctx context.Context, model
 		return nil
 	}
 	model, err := s.lookupModel(ctx, modelID)
-	if err != nil || model == nil || model.Limits.Vision == nil {
+	if err != nil {
 		return err
+	}
+	if model == nil {
+		return unknownModelCapabilitiesError(modelID, false, true)
+	}
+	if model.Limits.Vision == nil {
+		return nil
 	}
 	if len(model.Limits.Vision.SupportedMediaTypes) > 0 {
 		allowed := make(map[string]struct{}, len(model.Limits.Vision.SupportedMediaTypes))
