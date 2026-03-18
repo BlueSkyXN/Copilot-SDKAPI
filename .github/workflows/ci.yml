@@ -72,5 +72,5 @@ jobs:
             if [ "$goos" = "windows" ]; then
               output="${output}.exe"
             fi
-            GOOS="$goos" GOARCH="$goarch" go build -trimpath -o "$output" ./cmd/gateway
+            GOOS="$goos" GOARCH="$goarch" go build -trimpath -o "$output" ./cmd/copilot-sdkapi
           done

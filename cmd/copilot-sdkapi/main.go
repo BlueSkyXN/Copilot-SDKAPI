@@ -74,9 +74,9 @@ func main() {
 	go runSessionCleanup(ctx, logger, sessionManager, cfg.SessionTTL)
 
 	go func() {
-		logger.Info("starting gateway", slog.String("addr", cfg.ListenAddr), slog.String("default_model", cfg.DefaultModel))
+		logger.Info("starting copilot-sdkapi", slog.String("addr", cfg.ListenAddr), slog.String("default_model", cfg.DefaultModel))
 		if err := httpServer.ListenAndServe(); err != nil && !errors.Is(err, http.ErrServerClosed) {
-			logger.Error("gateway server stopped unexpectedly", slog.Any("err", err))
+			logger.Error("copilot-sdkapi server stopped unexpectedly", slog.Any("err", err))
 			stop()
 		}
 	}()

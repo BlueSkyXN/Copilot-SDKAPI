@@ -81,7 +81,7 @@ export GATEWAY_API_KEYS=test-key
 ```bash
 cd /Users/sky/Github/Copilot-SDKAPI
 export GATEWAY_LOG_LEVEL=info
-go run ./cmd/gateway
+go run ./cmd/copilot-sdkapi
 ```
 
 最小可运行组合通常是：
@@ -89,7 +89,7 @@ go run ./cmd/gateway
 ```bash
 export GATEWAY_DEFAULT_MODEL=gpt-4.1
 export GATEWAY_USE_LOGGED_IN_USER=true
-go run ./cmd/gateway
+go run ./cmd/copilot-sdkapi
 ```
 
 如果你更希望显式指定 token，则把 `GATEWAY_USE_LOGGED_IN_USER=true` 换成 `GATEWAY_GITHUB_TOKEN=...`。  
@@ -137,5 +137,5 @@ cd /Users/sky/Github/Copilot-SDKAPI
 GATEWAY_API_KEYS=test-key \
 GATEWAY_LOG_LEVEL=info \
 GATEWAY_DEFAULT_MODEL=gpt-4.1 \
-go run ./cmd/gateway
+go run ./cmd/copilot-sdkapi
 ```

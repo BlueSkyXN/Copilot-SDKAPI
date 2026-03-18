@@ -32,7 +32,7 @@ func (r *Recorder) Record(record Record) {
 	if r == nil || r.logger == nil {
 		return
 	}
-	r.logger.Info("gateway request completed",
+	r.logger.Info("copilot-sdkapi request completed",
 		slog.String("request_id", record.RequestID),
 		slog.String("route", record.Route),
 		slog.String("api_key_label", record.APIKeyLabel),

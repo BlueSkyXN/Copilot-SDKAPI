@@ -1,4 +1,4 @@
-# Copilot SDK API Gateway
+# copilot-sdkapi
 
 基于官方 `copilot-sdk` Go SDK 实现的兼容网关，对外提供：
 

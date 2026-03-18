@@ -142,7 +142,7 @@ jobs:
           binary_name="${APP_NAME}${EXT}"
 
           mkdir -p "dist/${package_dir}"
-          GOOS="$GOOS" GOARCH="$GOARCH" go build -trimpath -o "dist/${package_dir}/${binary_name}" ./cmd/gateway
+          GOOS="$GOOS" GOARCH="$GOARCH" go build -trimpath -o "dist/${package_dir}/${binary_name}" ./cmd/copilot-sdkapi
 
           cp README.md LICENSE "dist/${package_dir}/"
 
