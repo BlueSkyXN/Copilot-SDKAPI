@@ -1,6 +1,7 @@
 package compat
 
 import (
+	"bytes"
 	"encoding/json"
 	"fmt"
 	"io"
@@ -11,32 +12,53 @@ import (
 )
 
 type OpenAIChatCompletionRequest struct {
-	Model           string                   `json:"model"`
-	Messages        []json.RawMessage        `json:"messages"`
-	Stream          bool                     `json:"stream,omitempty"`
-	MaxTokens       *int                     `json:"max_tokens,omitempty"`
-	Temperature     *float64                 `json:"temperature,omitempty"`
-	TopP            *float64                 `json:"top_p,omitempty"`
-	ReasoningEffort string                   `json:"reasoning_effort,omitempty"`
-	Tools           []json.RawMessage        `json:"tools,omitempty"`
-	XCopilot        *CopilotRequestExtension `json:"x_copilot,omitempty"`
-}
-
-var openAIAllowedFields = map[string]struct{}{
-	"model":            {},
-	"messages":         {},
-	"stream":           {},
-	"max_tokens":       {},
-	"temperature":      {},
-	"top_p":            {},
-	"reasoning_effort": {},
-	"tools":            {},
-	"x_copilot":        {},
+	Model               string                   `json:"model"`
+	Messages            []json.RawMessage        `json:"messages"`
+	Stream              bool                     `json:"stream,omitempty"`
+	MaxTokens           *int                     `json:"max_tokens,omitempty"`
+	MaxCompletionTokens *int                     `json:"max_completion_tokens,omitempty"`
+	Temperature         *float64                 `json:"temperature,omitempty"`
+	TopP                *float64                 `json:"top_p,omitempty"`
+	PresencePenalty     *float64                 `json:"presence_penalty,omitempty"`
+	FrequencyPenalty    *float64                 `json:"frequency_penalty,omitempty"`
+	N                   *int                     `json:"n,omitempty"`
+	Stop                any                      `json:"stop,omitempty"`
+	User                string                   `json:"user,omitempty"`
+	ServiceTier         string                   `json:"service_tier,omitempty"`
+	Store               *bool                    `json:"store,omitempty"`
+	ResponseFormat      json.RawMessage          `json:"response_format,omitempty"`
+	StreamOptions       json.RawMessage          `json:"stream_options,omitempty"`
+	Metadata            json.RawMessage          `json:"metadata,omitempty"`
+	Modalities          []string                 `json:"modalities,omitempty"`
+	Audio               json.RawMessage          `json:"audio,omitempty"`
+	ReasoningEffort     string                   `json:"reasoning_effort,omitempty"`
+	Tools               []json.RawMessage        `json:"tools,omitempty"`
+	ToolChoice          json.RawMessage          `json:"tool_choice,omitempty"`
+	ParallelToolCalls   *bool                    `json:"parallel_tool_calls,omitempty"`
+	Functions           []json.RawMessage        `json:"functions,omitempty"`
+	FunctionCall        json.RawMessage          `json:"function_call,omitempty"`
+	XCopilot            *CopilotRequestExtension `json:"x_copilot,omitempty"`
 }
 
 type OpenAIMessage struct {
-	Role    string `json:"role"`
-	Content any    `json:"content"`
+	Role         string          `json:"role"`
+	Content      any             `json:"content"`
+	Name         string          `json:"name,omitempty"`
+	ToolCalls    json.RawMessage `json:"tool_calls,omitempty"`
+	ToolCallID   string          `json:"tool_call_id,omitempty"`
+	FunctionCall json.RawMessage `json:"function_call,omitempty"`
+	Refusal      string          `json:"refusal,omitempty"`
+}
+
+type OpenAIChatTool struct {
+	Type     string                    `json:"type,omitempty"`
+	Function *OpenAIFunctionDefinition `json:"function,omitempty"`
+}
+
+type OpenAIFunctionDefinition struct {
+	Name        string         `json:"name"`
+	Description string         `json:"description,omitempty"`
+	Parameters  map[string]any `json:"parameters,omitempty"`
 }
 
 type OpenAIChatCompletionResponse struct {
@@ -116,28 +138,30 @@ func ParseOpenAIChatCompletionRequest(body io.Reader) (ConversationRequest, erro
 		return ConversationRequest{}, err
 	}
 
-	var raw map[string]json.RawMessage
-	if err := json.Unmarshal(payload, &raw); err != nil {
-		return ConversationRequest{}, fmt.Errorf("decode OpenAI request: %w", err)
-	}
-	for key := range raw {
-		if _, ok := openAIAllowedFields[key]; !ok {
-			return ConversationRequest{}, fmt.Errorf("%w: %s", ErrUnsupportedControls, key)
-		}
-	}
-
 	var request OpenAIChatCompletionRequest
 	if err := json.Unmarshal(payload, &request); err != nil {
 		return ConversationRequest{}, fmt.Errorf("decode OpenAI request: %w", err)
 	}
-	if len(request.Tools) > 0 {
-		return ConversationRequest{}, ErrUnsupportedTools
-	}
-	if request.MaxTokens != nil || request.Temperature != nil || request.TopP != nil {
-		return ConversationRequest{}, ErrUnsupportedControls
-	}
 	if len(request.Messages) == 0 {
 		return ConversationRequest{}, ErrNoTurns
+	}
+	if request.N != nil && *request.N != 1 {
+		return ConversationRequest{}, fmt.Errorf("%w: only n=1 is supported", ErrUnsupportedControls)
+	}
+	if requestsOpenAIAudioOutput(request.Modalities, request.Audio) {
+		return ConversationRequest{}, fmt.Errorf("%w: audio output is not supported by this gateway yet", ErrUnsupportedControls)
+	}
+
+	ext := CopilotRequestExtension{}
+	if request.XCopilot != nil {
+		ext = *request.XCopilot
+	}
+	standardTools, err := mapOpenAICompatibleTools(request.Tools, request.Functions, request.ToolChoice, request.FunctionCall)
+	if err != nil {
+		return ConversationRequest{}, err
+	}
+	if len(standardTools) > 0 {
+		ext.Tools = append(append([]CopilotToolDefinition(nil), standardTools...), ext.Tools...)
 	}
 
 	var systemParts []string
@@ -147,7 +171,7 @@ func ParseOpenAIChatCompletionRequest(body io.Reader) (ConversationRequest, erro
 		if err != nil {
 			return ConversationRequest{}, err
 		}
-		if role == "system" {
+		if role == "system" || role == "developer" {
 			if len(attachments) > 0 {
 				return ConversationRequest{}, ErrUnsupportedImages
 			}
@@ -165,10 +189,6 @@ func ParseOpenAIChatCompletionRequest(body io.Reader) (ConversationRequest, erro
 		return ConversationRequest{}, err
 	}
 
-	ext := CopilotRequestExtension{}
-	if request.XCopilot != nil {
-		ext = *request.XCopilot
-	}
 	return ConversationRequest{
 		Model:           request.Model,
 		SystemPrompt:    strings.TrimSpace(strings.Join(systemParts, "\n\n")),
@@ -180,18 +200,6 @@ func ParseOpenAIChatCompletionRequest(body io.Reader) (ConversationRequest, erro
 }
 
 func parseOpenAIMessage(raw json.RawMessage) (string, string, []ImageAttachment, error) {
-	var fields map[string]json.RawMessage
-	if err := json.Unmarshal(raw, &fields); err != nil {
-		return "", "", nil, fmt.Errorf("decode OpenAI message: %w", err)
-	}
-	for key := range fields {
-		switch key {
-		case "role", "content":
-		default:
-			return "", "", nil, fmt.Errorf("%w: %s", ErrUnsupportedMessageFields, key)
-		}
-	}
-
 	var message OpenAIMessage
 	if err := json.Unmarshal(raw, &message); err != nil {
 		return "", "", nil, fmt.Errorf("decode OpenAI message: %w", err)
@@ -199,7 +207,7 @@ func parseOpenAIMessage(raw json.RawMessage) (string, string, []ImageAttachment,
 
 	role := strings.ToLower(strings.TrimSpace(message.Role))
 	switch role {
-	case "system", "user", "assistant":
+	case "system", "developer", "user", "assistant", "tool":
 	default:
 		return "", "", nil, fmt.Errorf("%w: role %s", ErrUnsupportedMessageFields, message.Role)
 	}
@@ -208,7 +216,162 @@ func parseOpenAIMessage(raw json.RawMessage) (string, string, []ImageAttachment,
 	if err != nil {
 		return "", "", nil, err
 	}
-	return role, content, attachments, nil
+	return role, renderOpenAIMessageContent(role, content, message.Name, message.ToolCalls, message.FunctionCall, message.ToolCallID, message.Refusal), attachments, nil
+}
+
+func mapOpenAICompatibleTools(rawTools, rawFunctions []json.RawMessage, rawToolChoice, rawFunctionCall json.RawMessage) ([]CopilotToolDefinition, error) {
+	if disablesOpenAITools(rawToolChoice) || disablesOpenAITools(rawFunctionCall) {
+		return nil, nil
+	}
+
+	tools := make([]CopilotToolDefinition, 0, len(rawTools)+len(rawFunctions))
+	convertedTools, err := parseOpenAIChatTools(rawTools)
+	if err != nil {
+		return nil, err
+	}
+	tools = append(tools, convertedTools...)
+
+	convertedFunctions, err := parseOpenAIFunctionDefinitions(rawFunctions)
+	if err != nil {
+		return nil, err
+	}
+	tools = append(tools, convertedFunctions...)
+	return tools, nil
+}
+
+func parseOpenAIChatTools(rawTools []json.RawMessage) ([]CopilotToolDefinition, error) {
+	tools := make([]CopilotToolDefinition, 0, len(rawTools))
+	for _, rawTool := range rawTools {
+		var tool OpenAIChatTool
+		if err := json.Unmarshal(rawTool, &tool); err != nil {
+			return nil, fmt.Errorf("decode OpenAI tool: %w", err)
+		}
+		toolType := strings.ToLower(strings.TrimSpace(tool.Type))
+		if toolType == "" {
+			toolType = "function"
+		}
+		if toolType != "function" {
+			return nil, fmt.Errorf("%w: OpenAI tool type %s", ErrUnsupportedTools, tool.Type)
+		}
+		if tool.Function == nil {
+			return nil, fmt.Errorf("%w: OpenAI function tool is missing function metadata", ErrUnsupportedTools)
+		}
+		tools = append(tools, functionDefinitionToCopilotTool(tool.Function))
+	}
+	return tools, nil
+}
+
+func parseOpenAIFunctionDefinitions(rawFunctions []json.RawMessage) ([]CopilotToolDefinition, error) {
+	tools := make([]CopilotToolDefinition, 0, len(rawFunctions))
+	for _, rawFunction := range rawFunctions {
+		var function OpenAIFunctionDefinition
+		if err := json.Unmarshal(rawFunction, &function); err != nil {
+			return nil, fmt.Errorf("decode OpenAI function: %w", err)
+		}
+		tools = append(tools, functionDefinitionToCopilotTool(&function))
+	}
+	return tools, nil
+}
+
+func functionDefinitionToCopilotTool(function *OpenAIFunctionDefinition) CopilotToolDefinition {
+	if function == nil {
+		return CopilotToolDefinition{}
+	}
+	return CopilotToolDefinition{
+		Name:        strings.TrimSpace(function.Name),
+		Description: strings.TrimSpace(function.Description),
+		Parameters:  function.Parameters,
+	}
+}
+
+func disablesOpenAITools(raw json.RawMessage) bool {
+	if !hasNonNullJSON(raw) {
+		return false
+	}
+
+	var literal string
+	if err := json.Unmarshal(raw, &literal); err == nil {
+		return strings.EqualFold(strings.TrimSpace(literal), "none")
+	}
+
+	var typed struct {
+		Type string `json:"type"`
+	}
+	if err := json.Unmarshal(raw, &typed); err == nil {
+		return strings.EqualFold(strings.TrimSpace(typed.Type), "none")
+	}
+	return false
+}
+
+func requestsOpenAIAudioOutput(modalities []string, audio json.RawMessage) bool {
+	if hasNonNullJSON(audio) {
+		return true
+	}
+	for _, modality := range modalities {
+		normalized := strings.ToLower(strings.TrimSpace(modality))
+		if normalized != "" && normalized != "text" {
+			return true
+		}
+	}
+	return false
+}
+
+func hasNonNullJSON(raw json.RawMessage) bool {
+	trimmed := strings.TrimSpace(string(raw))
+	return trimmed != "" && trimmed != "null"
+}
+
+func renderOpenAIMessageContent(role, content, name string, toolCalls, functionCall json.RawMessage, toolCallID, refusal string) string {
+	parts := make([]string, 0, 6)
+
+	name = strings.TrimSpace(name)
+	if name != "" {
+		label := "Name"
+		if role == "tool" {
+			label = "Tool name"
+		}
+		parts = append(parts, fmt.Sprintf("%s: %s", label, name))
+	}
+
+	toolCallID = strings.TrimSpace(toolCallID)
+	if toolCallID != "" {
+		parts = append(parts, fmt.Sprintf("Tool call ID: %s", toolCallID))
+	}
+
+	content = strings.TrimSpace(content)
+	if content != "" {
+		if role == "tool" {
+			parts = append(parts, "Result:\n"+content)
+		} else {
+			parts = append(parts, content)
+		}
+	}
+
+	refusal = strings.TrimSpace(refusal)
+	if refusal != "" {
+		parts = append(parts, fmt.Sprintf("Refusal: %s", refusal))
+	}
+
+	if compact := compactJSON(toolCalls); compact != "" {
+		parts = append(parts, "Tool calls:\n"+compact)
+	}
+	if compact := compactJSON(functionCall); compact != "" {
+		parts = append(parts, "Function call:\n"+compact)
+	}
+	return joinPromptParts(parts...)
+}
+
+func compactJSON(raw json.RawMessage) string {
+	trimmed := strings.TrimSpace(string(raw))
+	if trimmed == "" || trimmed == "null" {
+		return ""
+	}
+
+	var buffer bytes.Buffer
+	if err := json.Compact(&buffer, raw); err != nil {
+		return trimmed
+	}
+	return buffer.String()
 }
 
 func BuildOpenAIChatCompletionResponse(responseID, model, content string, usage gatewayruntime.Usage, extension *CopilotResponseExtension) OpenAIChatCompletionResponse {

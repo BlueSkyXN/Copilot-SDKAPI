@@ -138,8 +138,12 @@ func normalizeRole(role string) string {
 	switch strings.ToLower(strings.TrimSpace(role)) {
 	case "system":
 		return "system"
+	case "developer":
+		return "developer"
 	case "assistant":
 		return "assistant"
+	case "tool":
+		return "tool"
 	default:
 		return "user"
 	}
@@ -215,8 +219,12 @@ func displayRole(role string) string {
 	switch normalizeRole(role) {
 	case "assistant":
 		return "Assistant"
+	case "developer":
+		return "Developer"
 	case "system":
 		return "System"
+	case "tool":
+		return "Tool"
 	default:
 		return "User"
 	}

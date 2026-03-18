@@ -67,6 +67,9 @@ func TestLoadParsesConfiguration(t *testing.T) {
 	if len(cfg.APIKeys) != 2 {
 		t.Fatalf("expected 2 api keys, got %d", len(cfg.APIKeys))
 	}
+	if cfg.UsingDefaultAPIKey {
+		t.Fatalf("expected explicit api keys to disable default fallback")
+	}
 	if len(cfg.SDKAvailableTools) != 2 || cfg.SDKAvailableTools[0] != "view" || cfg.SDKAvailableTools[1] != "edit" {
 		t.Fatalf("unexpected SDK available tools %#v", cfg.SDKAvailableTools)
 	}
@@ -103,5 +106,28 @@ func TestLoadParsesBridgePermissionMode(t *testing.T) {
 	}
 	if cfg.SDKPermissionMode != "bridge" {
 		t.Fatalf("unexpected permission mode %q", cfg.SDKPermissionMode)
+	}
+}
+
+func TestLoadFallsBackToDefaultTrialAPIKeyWhenUnset(t *testing.T) {
+	cfg, err := Load()
+	if err != nil {
+		t.Fatalf("load config: %v", err)
+	}
+
+	if cfg.ListenAddr != defaultListenAddr {
+		t.Fatalf("unexpected default listen addr %q", cfg.ListenAddr)
+	}
+	if !cfg.UsingDefaultAPIKey {
+		t.Fatalf("expected default api key fallback to be enabled")
+	}
+	if len(cfg.APIKeys) != 1 {
+		t.Fatalf("expected 1 default api key, got %d", len(cfg.APIKeys))
+	}
+	if cfg.APIKeys[0].Label != defaultAPIKeyLabel {
+		t.Fatalf("unexpected default api key label %q", cfg.APIKeys[0].Label)
+	}
+	if cfg.APIKeys[0].Secret != defaultAPIKeySecret {
+		t.Fatalf("unexpected default api key secret %q", cfg.APIKeys[0].Secret)
 	}
 }

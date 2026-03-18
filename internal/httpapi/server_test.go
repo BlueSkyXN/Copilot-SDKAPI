@@ -432,6 +432,37 @@ func TestInteractiveToolBridgeStreamsPendingRequestAndResumes(t *testing.T) {
 	}
 }
 
+func TestOpenAIStandardToolsMapIntoSessionOptions(t *testing.T) {
+	provider := &fakeProvider{
+		nextSession: &fakeSession{
+			id:       "standard-tool-session",
+			deltas:   []string{"ok"},
+			response: "ok",
+			usage: gatewayruntime.Usage{
+				InputTokens:  4,
+				OutputTokens: 2,
+			},
+		},
+	}
+	server := newTestServer(t, provider)
+
+	body := `{"model":"gpt-4.1","stream":true,"messages":[{"role":"user","content":"Use the tool"}],"tools":[{"type":"function","function":{"name":"lookup_issue","description":"Look up an issue","parameters":{"type":"object","properties":{"id":{"type":"string"}}}}}]}`
+	recorder := performRequest(server, http.MethodPost, "/v1/chat/completions", body, map[string]string{
+		"Authorization": "Bearer test-key",
+		"X-Session-ID":  "standard-tool-key",
+	})
+
+	if recorder.Code != http.StatusOK {
+		t.Fatalf("expected 200, got %d: %s", recorder.Code, recorder.Body.String())
+	}
+	if !strings.Contains(recorder.Body.String(), "data: [DONE]") {
+		t.Fatalf("expected streaming terminator, got %s", recorder.Body.String())
+	}
+	if len(provider.sessionOptions) != 1 || len(provider.sessionOptions[0].Tools) != 1 || provider.sessionOptions[0].Tools[0].Name != "lookup_issue" {
+		t.Fatalf("expected standard OpenAI tools to reach session options, got %#v", provider.sessionOptions)
+	}
+}
+
 func TestPermissionBridgeStreamsPendingRequestAndResumes(t *testing.T) {
 	provider := &permissionBridgeProvider{session: newPermissionBridgeSession("permission-session")}
 	server := newTestServerWithConfig(t, provider, func(cfg *config.Config) {
@@ -1139,14 +1170,14 @@ func TestClaudeInvalidImagePayloadRejectedAtHTTPBoundary(t *testing.T) {
 	}
 }
 
-func TestUnsupportedControlsReturn400(t *testing.T) {
-	server := newTestServer(t, &fakeProvider{})
+func TestOpenAIStandardControlsAreTolerated(t *testing.T) {
+	server := newTestServer(t, &fakeProvider{nextSession: &fakeSession{response: "ok"}})
 	recorder := performRequest(server, http.MethodPost, "/v1/chat/completions", `{"model":"gpt-4.1","temperature":0.2,"messages":[{"role":"user","content":"Hello"}]}`, map[string]string{
 		"Authorization": "Bearer test-key",
 	})
 
-	if recorder.Code != http.StatusBadRequest {
-		t.Fatalf("expected 400 for unsupported controls, got %d", recorder.Code)
+	if recorder.Code != http.StatusOK {
+		t.Fatalf("expected 200 for tolerated OpenAI controls, got %d: %s", recorder.Code, recorder.Body.String())
 	}
 }
 

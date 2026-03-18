@@ -29,6 +29,9 @@ func main() {
 	logger := slog.New(slog.NewTextHandler(os.Stdout, &slog.HandlerOptions{
 		Level: parseLogLevel(cfg.LogLevel),
 	}))
+	if cfg.UsingDefaultAPIKey && len(cfg.APIKeys) > 0 {
+		logger.Warn("GATEWAY_API_KEYS is unset; using local trial API key", slog.String("api_key", cfg.APIKeys[0].Secret))
+	}
 
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer stop()

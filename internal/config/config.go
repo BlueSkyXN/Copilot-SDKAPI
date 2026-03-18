@@ -13,7 +13,7 @@ import (
 )
 
 const (
-	defaultListenAddr        = ":8080"
+	defaultListenAddr        = ":38095"
 	defaultModel             = "gpt-4.1"
 	defaultSessionTTL        = 15 * time.Minute
 	defaultStreamIdleTimout  = 2 * time.Minute
@@ -22,6 +22,8 @@ const (
 	defaultMaxBodyBytes      = 1 << 20
 	defaultMaxActiveSessions = 256
 	defaultMaxSessionsPerKey = 64
+	defaultAPIKeyLabel       = "default"
+	defaultAPIKeySecret      = "test-key"
 )
 
 type Config struct {
@@ -52,6 +54,7 @@ type Config struct {
 	SDKPermissionMode      gatewayruntime.PermissionMode
 	SDKInfiniteSessions    *gatewayruntime.InfiniteSessionOptions
 	APIKeys                []APIKey
+	UsingDefaultAPIKey     bool
 }
 
 type APIKey struct {
@@ -212,11 +215,12 @@ func Load() (Config, error) {
 	}
 	cfg.UseLoggedInUser = useLoggedInUser
 
-	apiKeys, err := parseAPIKeys(os.Getenv("GATEWAY_API_KEYS"))
+	apiKeys, usingDefaultAPIKey, err := parseAPIKeys(os.Getenv("GATEWAY_API_KEYS"))
 	if err != nil {
 		return Config{}, err
 	}
 	cfg.APIKeys = apiKeys
+	cfg.UsingDefaultAPIKey = usingDefaultAPIKey
 
 	return cfg, nil
 }
@@ -356,7 +360,14 @@ func normalizeListenAddr(value string) string {
 	return ":" + value
 }
 
-func parseAPIKeys(raw string) ([]APIKey, error) {
+func parseAPIKeys(raw string) ([]APIKey, bool, error) {
+	if strings.TrimSpace(raw) == "" {
+		return []APIKey{{
+			Label:  defaultAPIKeyLabel,
+			Secret: defaultAPIKeySecret,
+		}}, true, nil
+	}
+
 	parts := strings.Split(raw, ",")
 	keys := make([]APIKey, 0, len(parts))
 	for index, part := range parts {
@@ -371,12 +382,12 @@ func parseAPIKeys(raw string) ([]APIKey, error) {
 			secret = strings.TrimSpace(right)
 		}
 		if label == "" || secret == "" {
-			return nil, fmt.Errorf("invalid GATEWAY_API_KEYS entry %q", part)
+			return nil, false, fmt.Errorf("invalid GATEWAY_API_KEYS entry %q", part)
 		}
 		keys = append(keys, APIKey{Label: label, Secret: secret})
 	}
 	if len(keys) == 0 {
-		return nil, fmt.Errorf("GATEWAY_API_KEYS must contain at least one API key")
+		return nil, false, fmt.Errorf("GATEWAY_API_KEYS must contain at least one API key")
 	}
-	return keys, nil
+	return keys, false, nil
 }

@@ -133,16 +133,86 @@ func TestParseClaudeMessagesRequestSupportsReasoningAndImage(t *testing.T) {
 	}
 }
 
-func TestParseOpenAIChatCompletionRequestRejectsControls(t *testing.T) {
+func TestParseOpenAIChatCompletionRequestToleratesStandardControls(t *testing.T) {
 	body := `{
 		"model": "gpt-4.1",
+		"max_tokens": 128,
+		"max_completion_tokens": 256,
 		"temperature": 0.1,
+		"top_p": 0.9,
+		"presence_penalty": 0.2,
+		"frequency_penalty": 0.1,
+		"user": "alice",
+		"store": true,
+		"metadata": {"source":"sdk"},
+		"response_format": {"type":"json_object"},
+		"stream_options": {"include_usage": true},
 		"messages": [{"role":"user","content":"Hello"}]
 	}`
 
-	_, err := ParseOpenAIChatCompletionRequest(strings.NewReader(body))
-	if err != ErrUnsupportedControls {
-		t.Fatalf("expected ErrUnsupportedControls, got %v", err)
+	request, err := ParseOpenAIChatCompletionRequest(strings.NewReader(body))
+	if err != nil {
+		t.Fatalf("expected standard OpenAI controls to be tolerated, got %v", err)
+	}
+	if len(request.Turns) != 1 || request.Turns[0].Content != "Hello" {
+		t.Fatalf("unexpected parsed turns %#v", request.Turns)
+	}
+}
+
+func TestParseOpenAIChatCompletionRequestMapsStandardTools(t *testing.T) {
+	body := `{
+		"model": "gpt-4.1",
+		"stream": true,
+		"tools": [{
+			"type": "function",
+			"function": {
+				"name": "lookup_issue",
+				"description": "Look up an issue",
+				"parameters": {
+					"type": "object",
+					"properties": {
+						"id": {"type":"string"}
+					},
+					"required": ["id"]
+				}
+			}
+		}],
+		"messages": [{"role":"user","content":"Hello"}]
+	}`
+
+	request, err := ParseOpenAIChatCompletionRequest(strings.NewReader(body))
+	if err != nil {
+		t.Fatalf("parse request: %v", err)
+	}
+	if len(request.Copilot.Tools) != 1 {
+		t.Fatalf("expected one mapped tool, got %#v", request.Copilot.Tools)
+	}
+	tool := request.Copilot.Tools[0]
+	if tool.Name != "lookup_issue" || tool.Description != "Look up an issue" {
+		t.Fatalf("unexpected mapped tool %#v", tool)
+	}
+	if tool.Parameters["type"] != "object" {
+		t.Fatalf("expected parameters to be preserved, got %#v", tool.Parameters)
+	}
+}
+
+func TestParseOpenAIChatCompletionRequestHonorsToolChoiceNone(t *testing.T) {
+	body := `{
+		"model": "gpt-4.1",
+		"tool_choice": "none",
+		"tools": [{
+			"type": "function",
+			"function": {"name": "lookup_issue"}
+		}],
+		"messages": [{"role":"user","content":"Hello"}]
+	}`
+
+	request, err := ParseOpenAIChatCompletionRequest(strings.NewReader(body))
+	if err != nil {
+		t.Fatalf("parse request: %v", err)
+	}
+	if len(request.Copilot.Tools) != 0 {
+		t.Fatalf("expected standard tools to be disabled by tool_choice=none, got %#v", request.Copilot.Tools)
 	}
 }
 
@@ -159,19 +229,6 @@ func TestParseClaudeMessagesRequestRejectsControls(t *testing.T) {
 	}
 }
 
-func TestParseOpenAIChatCompletionRequestRejectsUnknownControls(t *testing.T) {
-	body := `{
-		"model": "gpt-4.1",
-		"presence_penalty": 0.1,
-		"messages": [{"role":"user","content":"Hello"}]
-	}`
-
-	_, err := ParseOpenAIChatCompletionRequest(strings.NewReader(body))
-	if err != ErrUnsupportedControls && !strings.Contains(err.Error(), ErrUnsupportedControls.Error()) {
-		t.Fatalf("expected unsupported controls error, got %v", err)
-	}
-}
-
 func TestParseClaudeMessagesRequestRejectsUnknownControls(t *testing.T) {
 	body := `{
 		"model": "claude-sonnet-4.5",
@@ -185,15 +242,36 @@ func TestParseClaudeMessagesRequestRejectsUnknownControls(t *testing.T) {
 	}
 }
 
-func TestParseOpenAIChatCompletionRequestRejectsUnsupportedMessageFields(t *testing.T) {
+func TestParseOpenAIChatCompletionRequestSupportsDeveloperAndToolMessages(t *testing.T) {
 	body := `{
 		"model": "gpt-4.1",
-		"messages": [{"role":"assistant","content":"Hello","tool_calls":[]}]
+		"messages": [
+			{"role":"developer","content":"Follow policy"},
+			{"role":"user","name":"alice","content":"Need issue details"},
+			{"role":"assistant","content":null,"tool_calls":[{"id":"call_1","type":"function","function":{"name":"lookup_issue","arguments":"{\"id\":\"123\"}"}}]},
+			{"role":"tool","tool_call_id":"call_1","name":"lookup_issue","content":"Issue 123"},
+			{"role":"user","content":"Thanks"}
+		]
 	}`
 
-	_, err := ParseOpenAIChatCompletionRequest(strings.NewReader(body))
-	if err != ErrUnsupportedMessageFields && !strings.Contains(err.Error(), ErrUnsupportedMessageFields.Error()) {
-		t.Fatalf("expected unsupported message fields error, got %v", err)
+	request, err := ParseOpenAIChatCompletionRequest(strings.NewReader(body))
+	if err != nil {
+		t.Fatalf("parse request: %v", err)
+	}
+	if request.SystemPrompt != "Follow policy" {
+		t.Fatalf("expected developer message to feed system prompt, got %q", request.SystemPrompt)
+	}
+	if len(request.Turns) != 4 {
+		t.Fatalf("expected 4 conversation turns, got %#v", request.Turns)
+	}
+	if !strings.Contains(request.Turns[0].Content, "Name: alice") {
+		t.Fatalf("expected user name to be preserved in prompt content, got %q", request.Turns[0].Content)
+	}
+	if !strings.Contains(request.Turns[1].Content, "Tool calls:") {
+		t.Fatalf("expected assistant tool calls to be preserved, got %q", request.Turns[1].Content)
+	}
+	if request.Turns[2].Role != "tool" || !strings.Contains(request.Turns[2].Content, "Tool call ID: call_1") || !strings.Contains(request.Turns[2].Content, "Issue 123") {
+		t.Fatalf("expected tool message metadata to be preserved, got %#v", request.Turns[2])
 	}
 }
 
@@ -254,6 +332,33 @@ func TestParseOpenAIChatCompletionRequestRejectsSystemImageBlocks(t *testing.T) 
 	_, err := ParseOpenAIChatCompletionRequest(strings.NewReader(body))
 	if err != ErrUnsupportedImages {
 		t.Fatalf("expected ErrUnsupportedImages, got %v", err)
+	}
+}
+
+func TestParseOpenAIChatCompletionRequestRejectsMultipleChoices(t *testing.T) {
+	body := `{
+		"model": "gpt-4.1",
+		"n": 2,
+		"messages": [{"role":"user","content":"Hello"}]
+	}`
+
+	_, err := ParseOpenAIChatCompletionRequest(strings.NewReader(body))
+	if err != ErrUnsupportedControls && !strings.Contains(err.Error(), ErrUnsupportedControls.Error()) {
+		t.Fatalf("expected unsupported controls error, got %v", err)
+	}
+}
+
+func TestParseOpenAIChatCompletionRequestRejectsAudioOutput(t *testing.T) {
+	body := `{
+		"model": "gpt-4.1",
+		"modalities": ["text", "audio"],
+		"audio": {"voice":"alloy"},
+		"messages": [{"role":"user","content":"Hello"}]
+	}`
+
+	_, err := ParseOpenAIChatCompletionRequest(strings.NewReader(body))
+	if err != ErrUnsupportedControls && !strings.Contains(err.Error(), ErrUnsupportedControls.Error()) {
+		t.Fatalf("expected unsupported controls error, got %v", err)
 	}
 }
 
