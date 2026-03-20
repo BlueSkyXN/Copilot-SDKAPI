@@ -71,6 +71,23 @@ func TestManagerRejectsSpecMismatch(t *testing.T) {
 	}
 }
 
+func TestManagerRejectsProviderFingerprintMismatch(t *testing.T) {
+	manager := NewManager(5 * time.Minute)
+	factory := func(context.Context) (gatewayruntime.Session, error) {
+		return &fakeSession{id: "session"}, nil
+	}
+
+	lease, err := manager.Acquire(context.Background(), "tenant:session", Spec{Model: "gpt-4.1", ProviderFingerprint: "provider-a"}, factory, nil, nil)
+	if err != nil {
+		t.Fatalf("acquire: %v", err)
+	}
+	defer lease.Release()
+
+	if _, err := manager.Acquire(context.Background(), "tenant:session", Spec{Model: "gpt-4.1", ProviderFingerprint: "provider-b"}, factory, nil, nil); err != ErrSessionSpecMismatch {
+		t.Fatalf("expected ErrSessionSpecMismatch, got %v", err)
+	}
+}
+
 func TestDiscardRemovesPersistentSession(t *testing.T) {
 	manager := NewManager(5 * time.Minute)
 	factory := func(context.Context) (gatewayruntime.Session, error) {
@@ -353,6 +370,50 @@ func TestManagerRejectsPersistedSpecMismatch(t *testing.T) {
 	restarted := NewManagerWithStore(5*time.Minute, Limits{}, store)
 	if _, err := restarted.Acquire(context.Background(), "tenant:session", Spec{Model: "claude"}, factory, nil, nil); !errors.Is(err, ErrSessionSpecMismatch) {
 		t.Fatalf("expected persisted spec mismatch, got %v", err)
+	}
+}
+
+func TestManagerIgnoresProviderSecretFingerprintAcrossRestarts(t *testing.T) {
+	store := NewFileStore(t.TempDir() + "/sessions.json")
+	spec := Spec{
+		Model:                     "gpt-4.1",
+		ProviderFingerprint:       "provider-public",
+		ProviderSecretFingerprint: "secret-a",
+	}
+	manager := NewManagerWithStore(5*time.Minute, Limits{}, store)
+	factory := func(context.Context) (gatewayruntime.Session, error) {
+		return &fakeSession{id: "tenant:session"}, nil
+	}
+
+	lease, err := manager.Acquire(context.Background(), "tenant:session", spec, factory, nil, nil)
+	if err != nil {
+		t.Fatalf("initial acquire: %v", err)
+	}
+	if err := lease.Release(); err != nil {
+		t.Fatalf("initial release: %v", err)
+	}
+
+	resumed := 0
+	restarted := NewManagerWithStore(5*time.Minute, Limits{}, store)
+	resume := func(_ context.Context, sessionID string) (gatewayruntime.Session, error) {
+		resumed++
+		return &fakeSession{id: sessionID}, nil
+	}
+	changedSecret := Spec{
+		Model:                     "gpt-4.1",
+		ProviderFingerprint:       "provider-public",
+		ProviderSecretFingerprint: "secret-b",
+	}
+	secondLease, err := restarted.Acquire(context.Background(), "tenant:session", changedSecret, factory, resume, nil)
+	if err != nil {
+		t.Fatalf("resume acquire: %v", err)
+	}
+	defer secondLease.Release()
+	if secondLease.Created() {
+		t.Fatalf("expected persisted session to be resumed despite secret-only change")
+	}
+	if resumed != 1 {
+		t.Fatalf("expected one resume, got %d", resumed)
 	}
 }
 

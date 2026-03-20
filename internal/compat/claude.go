@@ -20,6 +20,13 @@ type ClaudeMessagesRequest struct {
 	XCopilot        *CopilotRequestExtension `json:"x_copilot,omitempty"`
 }
 
+type ClaudeTool struct {
+	Type        string         `json:"type,omitempty"`
+	Name        string         `json:"name,omitempty"`
+	Description string         `json:"description,omitempty"`
+	InputSchema map[string]any `json:"input_schema,omitempty"`
+}
+
 var claudeAllowedFields = map[string]struct{}{
 	"model":            {},
 	"max_tokens":       {},
@@ -80,9 +87,6 @@ func ParseClaudeMessagesRequest(body io.Reader) (ConversationRequest, error) {
 	if err := json.Unmarshal(payload, &request); err != nil {
 		return ConversationRequest{}, fmt.Errorf("decode Claude request: %w", err)
 	}
-	if len(request.Tools) > 0 {
-		return ConversationRequest{}, ErrUnsupportedTools
-	}
 	if request.MaxTokens != nil {
 		return ConversationRequest{}, ErrUnsupportedControls
 	}
@@ -118,6 +122,13 @@ func ParseClaudeMessagesRequest(body io.Reader) (ConversationRequest, error) {
 	if request.XCopilot != nil {
 		ext = *request.XCopilot
 	}
+	tools, err := parseClaudeToolDefinitions(request.Tools)
+	if err != nil {
+		return ConversationRequest{}, err
+	}
+	if len(tools) > 0 {
+		ext.Tools = append(append([]CopilotToolDefinition(nil), tools...), ext.Tools...)
+	}
 	return ConversationRequest{
 		Model:           request.Model,
 		SystemPrompt:    strings.TrimSpace(systemPrompt),
@@ -126,6 +137,25 @@ func ParseClaudeMessagesRequest(body io.Reader) (ConversationRequest, error) {
 		Turns:           turns,
 		Copilot:         ext,
 	}, nil
+}
+
+func parseClaudeToolDefinitions(rawTools []json.RawMessage) ([]CopilotToolDefinition, error) {
+	tools := make([]CopilotToolDefinition, 0, len(rawTools))
+	for _, rawTool := range rawTools {
+		var tool ClaudeTool
+		if err := json.Unmarshal(rawTool, &tool); err != nil {
+			return nil, fmt.Errorf("decode Claude tool: %w", err)
+		}
+		if strings.TrimSpace(tool.Type) != "" {
+			return nil, fmt.Errorf("%w: Claude server tool type %s", ErrUnsupportedTools, tool.Type)
+		}
+		tools = append(tools, CopilotToolDefinition{
+			Name:        strings.TrimSpace(tool.Name),
+			Description: strings.TrimSpace(tool.Description),
+			Parameters:  tool.InputSchema,
+		})
+	}
+	return tools, nil
 }
 
 func parseClaudeMessage(raw json.RawMessage) (string, string, []ImageAttachment, error) {

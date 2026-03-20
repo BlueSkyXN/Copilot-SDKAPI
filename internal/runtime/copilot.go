@@ -184,6 +184,9 @@ func (p *copilotProvider) NewSession(ctx context.Context, options SessionOptions
 	if options.ReasoningEffort != "" {
 		config.ReasoningEffort = options.ReasoningEffort
 	}
+	if options.Provider != nil {
+		config.Provider = copyProviderConfig(options.Provider)
+	}
 	if len(p.options.MCPServers) > 0 {
 		config.MCPServers = copyMCPServers(p.options.MCPServers)
 	}
@@ -252,6 +255,9 @@ func (p *copilotProvider) ResumeSession(ctx context.Context, sessionID string, o
 	}
 	if options.ReasoningEffort != "" {
 		config.ReasoningEffort = options.ReasoningEffort
+	}
+	if options.Provider != nil {
+		config.Provider = copyProviderConfig(options.Provider)
 	}
 	if len(p.options.MCPServers) > 0 {
 		config.MCPServers = copyMCPServers(p.options.MCPServers)
@@ -678,6 +684,25 @@ func copyCustomAgents(agents []CustomAgent) []copilot.CustomAgentConfig {
 		copied = append(copied, item)
 	}
 	return copied
+}
+
+func copyProviderConfig(provider *ProviderConfig) *copilot.ProviderConfig {
+	if provider == nil {
+		return nil
+	}
+	config := &copilot.ProviderConfig{
+		Type:        provider.Type,
+		WireApi:     provider.WireAPI,
+		BaseURL:     provider.BaseURL,
+		APIKey:      provider.APIKey,
+		BearerToken: provider.BearerToken,
+	}
+	if provider.AzureAPIVersion != "" {
+		config.Azure = &copilot.AzureProviderOptions{
+			APIVersion: provider.AzureAPIVersion,
+		}
+	}
+	return config
 }
 
 func normalizeSystemMessageMode(mode string) string {

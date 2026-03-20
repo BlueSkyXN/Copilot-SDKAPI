@@ -1,6 +1,7 @@
 package config
 
 import (
+	"strings"
 	"testing"
 	"time"
 )
@@ -129,5 +130,68 @@ func TestLoadFallsBackToDefaultTrialAPIKeyWhenUnset(t *testing.T) {
 	}
 	if cfg.APIKeys[0].Secret != defaultAPIKeySecret {
 		t.Fatalf("unexpected default api key secret %q", cfg.APIKeys[0].Secret)
+	}
+}
+
+func TestLoadPrefersGatewayGitHubTokenOverFallbacks(t *testing.T) {
+	t.Setenv("GATEWAY_API_KEYS", "one=key1")
+	t.Setenv("GATEWAY_GITHUB_TOKEN", "gateway-token")
+	t.Setenv("COPILOT_GITHUB_TOKEN", "copilot-token")
+	t.Setenv("GH_TOKEN", "gh-token")
+	t.Setenv("GITHUB_TOKEN", "github-token")
+	t.Setenv("GATEWAY_USE_LOGGED_IN_USER", "false")
+
+	cfg, err := Load()
+	if err != nil {
+		t.Fatalf("load config: %v", err)
+	}
+	if cfg.GitHubToken != "gateway-token" {
+		t.Fatalf("expected gateway token to win, got %q", cfg.GitHubToken)
+	}
+	if cfg.UseLoggedInUser {
+		t.Fatalf("expected explicit token to disable logged-in-user fallback")
+	}
+}
+
+func TestLoadFallsBackToCopilotGitHubToken(t *testing.T) {
+	t.Setenv("GATEWAY_API_KEYS", "one=key1")
+	t.Setenv("COPILOT_GITHUB_TOKEN", "copilot-token")
+
+	cfg, err := Load()
+	if err != nil {
+		t.Fatalf("load config: %v", err)
+	}
+	if cfg.GitHubToken != "copilot-token" {
+		t.Fatalf("expected COPILOT_GITHUB_TOKEN fallback, got %q", cfg.GitHubToken)
+	}
+}
+
+func TestLoadRejectsInvalidRequestTimeout(t *testing.T) {
+	t.Setenv("GATEWAY_API_KEYS", "one=key1")
+	t.Setenv("GATEWAY_REQUEST_TIMEOUT", "not-a-duration")
+
+	_, err := Load()
+	if err == nil || !strings.Contains(err.Error(), "parse GATEWAY_REQUEST_TIMEOUT") {
+		t.Fatalf("expected invalid request timeout error, got %v", err)
+	}
+}
+
+func TestLoadRejectsInvalidPermissionMode(t *testing.T) {
+	t.Setenv("GATEWAY_API_KEYS", "one=key1")
+	t.Setenv("GATEWAY_SDK_PERMISSION_MODE", "maybe")
+
+	_, err := Load()
+	if err == nil || !strings.Contains(err.Error(), "parse GATEWAY_SDK_PERMISSION_MODE") {
+		t.Fatalf("expected invalid permission mode error, got %v", err)
+	}
+}
+
+func TestLoadRejectsInvalidCustomAgentDefinition(t *testing.T) {
+	t.Setenv("GATEWAY_API_KEYS", "one=key1")
+	t.Setenv("GATEWAY_SDK_CUSTOM_AGENTS_JSON", `[{"name":"reviewer"}]`)
+
+	_, err := Load()
+	if err == nil || !strings.Contains(err.Error(), `must include prompt`) {
+		t.Fatalf("expected invalid custom agent error, got %v", err)
 	}
 }

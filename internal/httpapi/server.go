@@ -44,6 +44,7 @@ var errUnknownAgent = errors.New("unknown x_copilot.agent")
 var errInteractiveRequiresStream = errors.New("x_copilot continuation flows require stream=true")
 var errInteractiveRequiresSessionKey = errors.New("x_copilot continuation flows require X-Session-ID")
 var errInvalidCopilotPermissionMode = errors.New("unsupported x_copilot.permission_mode")
+var errInvalidCopilotProvider = errors.New("unsupported x_copilot.provider")
 var errCopilotPermissionEscalation = errors.New("x_copilot.permission_mode cannot exceed server permission policy")
 var errInvalidCopilotTool = errors.New("invalid x_copilot.tools entry")
 var errInvalidCopilotResponse = errors.New("invalid x_copilot continuation request")
@@ -97,6 +98,7 @@ type preparedConversation struct {
 	systemMessageMode    string
 	includeReasoning     bool
 	includeRuntimeEvents bool
+	includeUsageInStream bool
 	copilotRequested     bool
 }
 
@@ -281,7 +283,7 @@ func (s *Server) handleOpenAIChatCompletions(w http.ResponseWriter, r *http.Requ
 	if publicSessionKey != "" {
 		w.Header().Set("X-Session-ID", publicSessionKey)
 	}
-	writeJSON(w, http.StatusOK, compat.BuildOpenAIChatCompletionResponse(responseID, model, result.Content, result.Usage, s.buildCopilotResponseExtension(prepared, result)))
+	writeJSON(w, http.StatusOK, compat.BuildOpenAIChatCompletionResponse(responseID, model, result.Content, result.Reasoning, result.Usage, s.buildCopilotResponseExtension(prepared, result)))
 	s.recordUsage(identity, requestID, "/v1/chat/completions", model, result.SessionID, false, http.StatusOK, "", started, responseUsage)
 }
 
@@ -425,19 +427,25 @@ func (s *Server) prepareConversation(ctx context.Context, externalSessionKey str
 	systemMessageMode := effectiveSystemMessageMode(request.Copilot.SystemMessageMode)
 	agent := effectiveAgent(request.Copilot.Agent, s.cfg.SDKDefaultAgent)
 	runtimeTools := toRuntimeTools(request.Copilot.Tools)
+	runtimeProvider, providerFingerprint, providerSecretFingerprint, err := s.toRuntimeProvider(ctx, request.Copilot.Provider)
+	if err != nil {
+		return nil, err
+	}
 	toolsFingerprint, err := toolDefinitionsFingerprint(request.Copilot.Tools)
 	if err != nil {
 		return nil, fmt.Errorf("%w: %v", errInvalidCopilotTool, err)
 	}
 	spec := session.Spec{
-		Model:            model,
-		SystemPrompt:     request.SystemPrompt,
-		SystemPromptMode: systemMessageMode,
-		ReasoningEffort:  request.ReasoningEffort,
-		Agent:            agent,
-		Interactive:      request.Copilot.Interactive,
-		ToolsFingerprint: toolsFingerprint,
-		PermissionMode:   permissionMode,
+		Model:                     model,
+		SystemPrompt:              request.SystemPrompt,
+		SystemPromptMode:          systemMessageMode,
+		ReasoningEffort:           request.ReasoningEffort,
+		Agent:                     agent,
+		Interactive:               request.Copilot.Interactive,
+		ToolsFingerprint:          toolsFingerprint,
+		PermissionMode:            permissionMode,
+		ProviderFingerprint:       providerFingerprint,
+		ProviderSecretFingerprint: providerSecretFingerprint,
 	}
 	lease, err := s.sessions.Acquire(ctx, externalSessionKey, spec, func(factoryCtx context.Context) (gatewayruntime.Session, error) {
 		return s.provider.NewSession(factoryCtx, gatewayruntime.SessionOptions{
@@ -450,6 +458,7 @@ func (s *Server) prepareConversation(ctx context.Context, externalSessionKey str
 			Interactive:      request.Copilot.Interactive,
 			Tools:            runtimeTools,
 			PermissionMode:   permissionMode,
+			Provider:         runtimeProvider,
 		})
 	}, func(factoryCtx context.Context, sessionID string) (gatewayruntime.Session, error) {
 		return s.provider.ResumeSession(factoryCtx, sessionID, gatewayruntime.SessionOptions{
@@ -462,6 +471,7 @@ func (s *Server) prepareConversation(ctx context.Context, externalSessionKey str
 			Interactive:      request.Copilot.Interactive,
 			Tools:            runtimeTools,
 			PermissionMode:   permissionMode,
+			Provider:         runtimeProvider,
 		})
 	}, s.provider.DeleteSession)
 	if err != nil {
@@ -498,7 +508,7 @@ func (s *Server) prepareConversation(ctx context.Context, externalSessionKey str
 		return nil, err
 	}
 	cleanup := combineCleanup(imageCleanup, extraCleanup)
-	if err := s.validateMaterializedImageAttachments(ctx, model, imageAttachments); err != nil {
+	if err := s.validateMaterializedImageAttachments(ctx, model, imageAttachments, request.Copilot.Provider != nil); err != nil {
 		if cleanup != nil {
 			_ = cleanup()
 		}
@@ -519,6 +529,7 @@ func (s *Server) prepareConversation(ctx context.Context, externalSessionKey str
 		systemMessageMode:    systemMessageMode,
 		includeReasoning:     request.Copilot.IncludeReasoning,
 		includeRuntimeEvents: request.Copilot.IncludeRuntimeEvents || request.Copilot.Interactive || len(request.Copilot.Tools) > 0 || permissionMode == gatewayruntime.PermissionModeBridge,
+		includeUsageInStream: request.IncludeUsageInStream,
 		copilotRequested:     hasCopilotRequestExtension(request.Copilot),
 	}, nil
 }
@@ -552,6 +563,16 @@ func (s *Server) streamOpenAIChatCompletion(ctx context.Context, w http.Response
 		switch event.Type {
 		case gatewayruntime.EventMessageDelta:
 			return writeOpenAISSE(w, flusher, writeTimeout, compat.BuildOpenAIStreamChunk(responseID, prepared.model, compat.OpenAIDelta{Content: event.Delta}, nil, nil))
+		case gatewayruntime.EventReasoningDelta:
+			if strings.TrimSpace(event.Delta) != "" {
+				if err := writeOpenAISSE(w, flusher, writeTimeout, compat.BuildOpenAIStreamChunk(responseID, prepared.model, compat.OpenAIDelta{Reasoning: event.Delta}, nil, nil)); err != nil {
+					return err
+				}
+			}
+			if extension := s.openAIStreamExtension(event, prepared); extension != nil {
+				return writeOpenAISSE(w, flusher, writeTimeout, compat.BuildOpenAIStreamChunk(responseID, prepared.model, compat.OpenAIDelta{}, nil, extension))
+			}
+			return nil
 		case gatewayruntime.EventUsage:
 			latestUsage = event.Usage
 		default:
@@ -572,12 +593,21 @@ func (s *Server) streamOpenAIChatCompletion(ctx context.Context, w http.Response
 		_ = writeDone(w, flusher, writeTimeout)
 		return status, errorType, latestUsage
 	}
+	finalUsage := result.Usage
+	if finalUsage.TotalTokens() == 0 && latestUsage.TotalTokens() > 0 {
+		finalUsage = latestUsage
+	}
 	finishReason := "stop"
 	if err := writeOpenAISSE(w, flusher, writeTimeout, compat.BuildOpenAIStreamChunk(responseID, prepared.model, compat.OpenAIDelta{}, &finishReason, nil)); err != nil {
-		return http.StatusOK, "stream_write_error", result.Usage
+		return http.StatusOK, "stream_write_error", finalUsage
+	}
+	if prepared.includeUsageInStream {
+		if err := writeOpenAISSE(w, flusher, writeTimeout, compat.BuildOpenAIUsageChunk(responseID, prepared.model, finalUsage)); err != nil {
+			return http.StatusOK, "stream_write_error", finalUsage
+		}
 	}
 	_ = writeDone(w, flusher, writeTimeout)
-	return http.StatusOK, "", result.Usage
+	return http.StatusOK, "", finalUsage
 }
 
 func (s *Server) streamClaudeMessage(ctx context.Context, w http.ResponseWriter, prepared *preparedConversation, responseID string, publicSessionKey string, touch func()) (int, string, gatewayruntime.Usage) {
@@ -895,7 +925,7 @@ func classifyError(err error) (int, string, string) {
 		return http.StatusBadRequest, "invalid_request_error", err.Error()
 	case errors.Is(err, errInvalidSystemMessageMode), errors.Is(err, errUnknownAgent):
 		return http.StatusBadRequest, "invalid_request_error", err.Error()
-	case errors.Is(err, errInteractiveRequiresStream), errors.Is(err, errInteractiveRequiresSessionKey), errors.Is(err, errInvalidCopilotPermissionMode), errors.Is(err, errCopilotPermissionEscalation), errors.Is(err, errInvalidCopilotTool), errors.Is(err, errInvalidCopilotResponse), errors.Is(err, errInvalidCopilotAttachment):
+	case errors.Is(err, errInteractiveRequiresStream), errors.Is(err, errInteractiveRequiresSessionKey), errors.Is(err, errInvalidCopilotPermissionMode), errors.Is(err, errInvalidCopilotProvider), errors.Is(err, errCopilotPermissionEscalation), errors.Is(err, errInvalidCopilotTool), errors.Is(err, errInvalidCopilotResponse), errors.Is(err, errInvalidCopilotAttachment):
 		return http.StatusBadRequest, "invalid_request_error", err.Error()
 	case errors.Is(err, errUnsupportedReasoningEffort), errors.Is(err, errUnsupportedVisionModel), errors.Is(err, errModelLimitsExceeded), errors.Is(err, errUnknownModelCapabilities):
 		return http.StatusBadRequest, "invalid_request_error", err.Error()
@@ -1043,6 +1073,9 @@ func (s *Server) validateConversationFeatures(ctx context.Context, modelID strin
 	}
 
 	if request.ReasoningEffort == "" && attachmentCount(request.Turns) == 0 {
+		return nil
+	}
+	if request.Copilot.Provider != nil {
 		return nil
 	}
 
@@ -1214,6 +1247,7 @@ func hasCopilotRequestExtension(extension compat.CopilotRequestExtension) bool {
 		extension.IncludeRuntimeEvents ||
 		extension.Interactive ||
 		strings.TrimSpace(extension.PermissionMode) != "" ||
+		extension.Provider != nil ||
 		len(extension.Attachments) > 0 ||
 		len(extension.Tools) > 0 ||
 		strings.TrimSpace(extension.Agent) != "" ||
@@ -1238,6 +1272,92 @@ func toRuntimeTools(definitions []compat.CopilotToolDefinition) []gatewayruntime
 		})
 	}
 	return tools
+}
+
+func (s *Server) toRuntimeProvider(ctx context.Context, provider *compat.CopilotProviderConfig) (*gatewayruntime.ProviderConfig, string, string, error) {
+	if provider == nil {
+		return nil, "", "", nil
+	}
+	baseURL := strings.TrimSpace(provider.BaseURL)
+	if baseURL == "" {
+		return nil, "", "", fmt.Errorf("%w: x_copilot.provider.base_url is required", errInvalidCopilotProvider)
+	}
+	providerType := strings.ToLower(strings.TrimSpace(provider.Type))
+	if providerType == "" {
+		providerType = "openai"
+	}
+	switch providerType {
+	case "openai", "azure", "anthropic":
+	default:
+		return nil, "", "", fmt.Errorf("%w: unsupported x_copilot.provider.type %s", errInvalidCopilotProvider, provider.Type)
+	}
+	parsed, err := url.Parse(baseURL)
+	if err != nil {
+		return nil, "", "", fmt.Errorf("%w: x_copilot.provider.base_url must be an absolute URL", errInvalidCopilotProvider)
+	}
+	if err := s.validateProviderBaseURL(ctx, providerType, parsed); err != nil {
+		return nil, "", "", err
+	}
+
+	wireAPI := strings.ToLower(strings.TrimSpace(provider.WireAPI))
+	if providerType == "anthropic" {
+		if wireAPI != "" {
+			return nil, "", "", fmt.Errorf("%w: x_copilot.provider.wire_api is only valid for openai or azure providers", errInvalidCopilotProvider)
+		}
+	} else {
+		if wireAPI == "" {
+			wireAPI = "completions"
+		}
+		switch wireAPI {
+		case "completions", "responses":
+		default:
+			return nil, "", "", fmt.Errorf("%w: unsupported x_copilot.provider.wire_api %s", errInvalidCopilotProvider, provider.WireAPI)
+		}
+	}
+	azureAPIVersion := ""
+	if provider.Azure != nil {
+		azureAPIVersion = strings.TrimSpace(provider.Azure.APIVersion)
+		if azureAPIVersion != "" && providerType != "azure" {
+			return nil, "", "", fmt.Errorf("%w: x_copilot.provider.azure requires type=azure", errInvalidCopilotProvider)
+		}
+	}
+
+	runtimeProvider := &gatewayruntime.ProviderConfig{
+		Type:            providerType,
+		WireAPI:         wireAPI,
+		BaseURL:         baseURL,
+		APIKey:          strings.TrimSpace(provider.APIKey),
+		BearerToken:     strings.TrimSpace(provider.BearerToken),
+		AzureAPIVersion: azureAPIVersion,
+	}
+	publicFingerprintPayload, err := json.Marshal(struct {
+		Type            string `json:"type"`
+		WireAPI         string `json:"wire_api,omitempty"`
+		BaseURL         string `json:"base_url"`
+		AzureAPIVersion string `json:"azure_api_version,omitempty"`
+	}{
+		Type:            runtimeProvider.Type,
+		WireAPI:         runtimeProvider.WireAPI,
+		BaseURL:         runtimeProvider.BaseURL,
+		AzureAPIVersion: runtimeProvider.AzureAPIVersion,
+	})
+	if err != nil {
+		return nil, "", "", fmt.Errorf("%w: %v", errInvalidCopilotProvider, err)
+	}
+	publicSum := sha256.Sum256(publicFingerprintPayload)
+
+	secretFingerprintPayload, err := json.Marshal(struct {
+		APIKey      string `json:"api_key,omitempty"`
+		BearerToken string `json:"bearer_token,omitempty"`
+	}{
+		APIKey:      runtimeProvider.APIKey,
+		BearerToken: runtimeProvider.BearerToken,
+	})
+	if err != nil {
+		return nil, "", "", fmt.Errorf("%w: %v", errInvalidCopilotProvider, err)
+	}
+	secretSum := sha256.Sum256(secretFingerprintPayload)
+	return runtimeProvider, hex.EncodeToString(publicSum[:]), hex.EncodeToString(secretSum[:]), nil
 }
 
 func toolDefinitionsFingerprint(definitions []compat.CopilotToolDefinition) (string, error) {
@@ -1509,9 +1629,73 @@ func validateRemoteAttachmentIP(ip net.IP) error {
 	return nil
 }
 
+func (s *Server) validateProviderBaseURL(_ context.Context, providerType string, parsed *url.URL) error {
+	if parsed == nil || !parsed.IsAbs() {
+		return fmt.Errorf("%w: x_copilot.provider.base_url must be an absolute URL", errInvalidCopilotProvider)
+	}
+	if parsed.Scheme != "http" && parsed.Scheme != "https" {
+		return fmt.Errorf("%w: x_copilot.provider.base_url must use http or https", errInvalidCopilotProvider)
+	}
+	hostname := strings.TrimSpace(parsed.Hostname())
+	if hostname == "" {
+		return fmt.Errorf("%w: x_copilot.provider.base_url host is required", errInvalidCopilotProvider)
+	}
+	if s.cfg.AllowPrivateRemoteURLs {
+		return nil
+	}
+	if isLocalhostHostname(hostname) {
+		return fmt.Errorf("%w: private or special-use provider URLs are disabled", errInvalidCopilotProvider)
+	}
+	if ip := net.ParseIP(hostname); ip != nil {
+		return validateProviderIP(ip)
+	}
+	if isTrustedProviderHostname(providerType, hostname) {
+		return nil
+	}
+	return fmt.Errorf("%w: arbitrary provider hostnames are unsupported; use an official trusted host or an IP literal", errInvalidCopilotProvider)
+}
+
+func validateProviderIP(ip net.IP) error {
+	if ip == nil {
+		return fmt.Errorf("%w: invalid provider IP address", errInvalidCopilotProvider)
+	}
+	addr, ok := netip.AddrFromSlice(ip)
+	if !ok {
+		return fmt.Errorf("%w: invalid provider IP address", errInvalidCopilotProvider)
+	}
+	addr = addr.Unmap()
+	if !addr.IsValid() || !addr.IsGlobalUnicast() {
+		return fmt.Errorf("%w: private or special-use provider URLs are disabled", errInvalidCopilotProvider)
+	}
+	for _, prefix := range blockedRemoteIPPrefixes {
+		if prefix.Contains(addr) {
+			return fmt.Errorf("%w: private or special-use provider URLs are disabled", errInvalidCopilotProvider)
+		}
+	}
+	return nil
+}
+
 func isLocalhostHostname(host string) bool {
 	host = strings.ToLower(strings.TrimSpace(host))
 	return host == "localhost" || strings.HasSuffix(host, ".localhost")
+}
+
+func isTrustedProviderHostname(providerType, host string) bool {
+	host = strings.ToLower(strings.TrimSpace(host))
+	switch providerType {
+	case "openai":
+		return host == "api.openai.com"
+	case "anthropic":
+		return host == "api.anthropic.com"
+	case "azure":
+		if strings.HasPrefix(host, ".") || !strings.HasSuffix(host, ".openai.azure.com") {
+			return false
+		}
+		prefix := strings.TrimSuffix(host, ".openai.azure.com")
+		return prefix != "" && !strings.Contains(prefix, ".")
+	default:
+		return false
+	}
 }
 
 func mustParsePrefix(raw string) netip.Prefix {
@@ -1551,8 +1735,11 @@ func writeAttachmentFile(dir, nameHint, mediaType string, data []byte) (gatewayr
 	}, nil
 }
 
-func (s *Server) validateMaterializedImageAttachments(ctx context.Context, modelID string, attachments []gatewayruntime.Attachment) error {
+func (s *Server) validateMaterializedImageAttachments(ctx context.Context, modelID string, attachments []gatewayruntime.Attachment, skipModelValidation bool) error {
 	if len(attachments) == 0 {
+		return nil
+	}
+	if skipModelValidation {
 		return nil
 	}
 	model, err := s.lookupModel(ctx, modelID)

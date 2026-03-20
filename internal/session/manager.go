@@ -16,14 +16,16 @@ var ErrTooManySessions = errors.New("too many active sessions")
 var ErrTooManySessionsForNamespace = errors.New("too many active sessions for API key")
 
 type Spec struct {
-	Model            string
-	SystemPrompt     string
-	SystemPromptMode string
-	ReasoningEffort  string
-	Agent            string
-	Interactive      bool
-	ToolsFingerprint string
-	PermissionMode   gatewayruntime.PermissionMode
+	Model                     string
+	SystemPrompt              string
+	SystemPromptMode          string
+	ReasoningEffort           string
+	Agent                     string
+	Interactive               bool
+	ToolsFingerprint          string
+	PermissionMode            gatewayruntime.PermissionMode
+	ProviderFingerprint       string
+	ProviderSecretFingerprint string `json:"-"`
 }
 
 type Manager struct {
@@ -119,7 +121,7 @@ func (m *Manager) Acquire(
 		m.mu.Lock()
 		entry, exists := m.sessions[key]
 		if exists {
-			if entry.spec != spec {
+			if !specsEqual(entry.spec, spec) {
 				m.mu.Unlock()
 				return nil, ErrSessionSpecMismatch
 			}
@@ -177,7 +179,7 @@ func (m *Manager) Acquire(
 				return nil, err
 			}
 			if record != nil {
-				if record.Spec != spec {
+				if !persistedSpecMatches(record.Spec, spec) {
 					if err := m.removeStoredSession(ctx, key, record, deleteByID); err != nil {
 						cleanupEntry()
 						return nil, err
@@ -241,7 +243,7 @@ func (m *Manager) Acquire(
 			now := m.now()
 			record := StoredSession{
 				SessionID: sess.ID(),
-				Spec:      spec,
+				Spec:      specForStorage(spec),
 				CreatedAt: entry.createdAt,
 				UpdatedAt: now,
 			}
@@ -411,7 +413,7 @@ func (m *Manager) newLease(key string, entry *managedSession, created bool) *Lea
 			if m.store != nil {
 				err = m.store.Save(key, StoredSession{
 					SessionID: entry.sessionID,
-					Spec:      entry.spec,
+					Spec:      specForStorage(entry.spec),
 					CreatedAt: entry.createdAt,
 					UpdatedAt: now,
 				})
@@ -431,6 +433,19 @@ func (m *Manager) newLease(key string, entry *managedSession, created bool) *Lea
 			return err
 		},
 	}
+}
+
+func specsEqual(left, right Spec) bool {
+	return left == right
+}
+
+func specForStorage(spec Spec) Spec {
+	spec.ProviderSecretFingerprint = ""
+	return spec
+}
+
+func persistedSpecMatches(stored, requested Spec) bool {
+	return stored == specForStorage(requested)
 }
 
 func (m *Manager) destroyPersistentSession(ctx context.Context, entry *managedSession) error {

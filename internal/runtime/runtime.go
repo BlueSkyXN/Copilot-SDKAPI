@@ -34,6 +34,15 @@ type CustomAgent struct {
 	Infer       *bool
 }
 
+type ProviderConfig struct {
+	Type            string
+	WireAPI         string
+	BaseURL         string
+	APIKey          string
+	BearerToken     string
+	AzureAPIVersion string
+}
+
 type Options struct {
 	CLIPath          string
 	GitHubToken      string
@@ -64,6 +73,7 @@ type SessionOptions struct {
 	Interactive      bool
 	Tools            []ToolDefinition
 	PermissionMode   PermissionMode
+	Provider         *ProviderConfig
 }
 
 type Attachment struct {

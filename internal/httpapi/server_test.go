@@ -112,6 +112,61 @@ func TestHandleOpenAIChatCompletionsStream(t *testing.T) {
 	}
 }
 
+func TestHandleOpenAIChatCompletionsStreamIncludesUsageChunkWhenRequested(t *testing.T) {
+	provider := &fakeProvider{
+		nextSession: &fakeSession{
+			id:       "session-stream-usage",
+			deltas:   []string{"Hel", "lo"},
+			response: "Hello",
+			usage: gatewayruntime.Usage{
+				InputTokens:  9,
+				OutputTokens: 5,
+			},
+		},
+	}
+	server := newTestServer(t, provider)
+
+	body := `{"model":"gpt-4.1","stream":true,"stream_options":{"include_usage":true},"messages":[{"role":"user","content":"Hello"}]}`
+	recorder := performRequest(server, http.MethodPost, "/v1/chat/completions", body, map[string]string{
+		"Authorization": "Bearer test-key",
+	})
+
+	if recorder.Code != http.StatusOK {
+		t.Fatalf("expected 200, got %d: %s", recorder.Code, recorder.Body.String())
+	}
+	output := recorder.Body.String()
+	if !strings.Contains(output, `"choices":[],"usage":{"prompt_tokens":9,"completion_tokens":5,"total_tokens":14}`) {
+		t.Fatalf("expected final usage chunk, got %s", output)
+	}
+}
+
+func TestHandleOpenAIChatCompletionsStreamOmitsUsageChunkByDefault(t *testing.T) {
+	provider := &fakeProvider{
+		nextSession: &fakeSession{
+			id:       "session-stream-no-usage",
+			deltas:   []string{"Hel", "lo"},
+			response: "Hello",
+			usage: gatewayruntime.Usage{
+				InputTokens:  9,
+				OutputTokens: 5,
+			},
+		},
+	}
+	server := newTestServer(t, provider)
+
+	body := `{"model":"gpt-4.1","stream":true,"messages":[{"role":"user","content":"Hello"}]}`
+	recorder := performRequest(server, http.MethodPost, "/v1/chat/completions", body, map[string]string{
+		"Authorization": "Bearer test-key",
+	})
+
+	if recorder.Code != http.StatusOK {
+		t.Fatalf("expected 200, got %d: %s", recorder.Code, recorder.Body.String())
+	}
+	if strings.Contains(recorder.Body.String(), `"choices":[],"usage":`) {
+		t.Fatalf("expected default stream to omit usage chunk, got %s", recorder.Body.String())
+	}
+}
+
 func TestHandleClaudeMessagesStreamErrorEndsCleanly(t *testing.T) {
 	provider := &fakeProvider{
 		nextSession: &fakeSession{
@@ -174,6 +229,65 @@ func TestHandleClaudeMessagesJSON(t *testing.T) {
 	}
 	if response["type"] != "message" {
 		t.Fatalf("unexpected response type: %#v", response["type"])
+	}
+}
+
+func TestClaudeStandardToolsMapIntoSessionOptions(t *testing.T) {
+	provider := &fakeProvider{
+		nextSession: &fakeSession{
+			id:       "claude-tools",
+			deltas:   []string{"ok"},
+			response: "ok",
+			usage: gatewayruntime.Usage{
+				InputTokens:  4,
+				OutputTokens: 2,
+			},
+		},
+	}
+	server := newTestServer(t, provider)
+
+	body := `{
+		"model":"claude-sonnet-4.5",
+		"stream":true,
+		"messages":[{"role":"user","content":"Use the tool"}],
+		"tools":[{
+			"name":"lookup_issue",
+			"description":"Look up an issue",
+			"input_schema":{"type":"object","properties":{"id":{"type":"string"}}}
+		}]
+	}`
+	recorder := performRequest(server, http.MethodPost, "/v1/messages", body, map[string]string{
+		"Authorization":     "Bearer test-key",
+		"anthropic-version": "2023-06-01",
+		"X-Session-ID":      "claude-tool-key",
+	})
+
+	if recorder.Code != http.StatusOK {
+		t.Fatalf("expected 200, got %d: %s", recorder.Code, recorder.Body.String())
+	}
+	if len(provider.sessionOptions) != 1 || len(provider.sessionOptions[0].Tools) != 1 || provider.sessionOptions[0].Tools[0].Name != "lookup_issue" {
+		t.Fatalf("expected Claude tools to reach session options, got %#v", provider.sessionOptions)
+	}
+}
+
+func TestClaudeStandardToolsRequireSessionID(t *testing.T) {
+	server := newTestServer(t, &fakeProvider{})
+
+	body := `{
+		"model":"claude-sonnet-4.5",
+		"stream":true,
+		"messages":[{"role":"user","content":"Use the tool"}],
+		"tools":[{"name":"lookup_issue","input_schema":{"type":"object"}}]
+	}`
+	recorder := performRequest(server, http.MethodPost, "/v1/messages", body, map[string]string{
+		"Authorization":     "Bearer test-key",
+		"anthropic-version": "2023-06-01",
+	})
+	if recorder.Code != http.StatusBadRequest {
+		t.Fatalf("expected 400 for Claude tools without X-Session-ID, got %d: %s", recorder.Code, recorder.Body.String())
+	}
+	if !strings.Contains(recorder.Body.String(), "X-Session-ID") {
+		t.Fatalf("expected missing session ID validation error, got %s", recorder.Body.String())
 	}
 }
 
@@ -463,6 +577,119 @@ func TestOpenAIStandardToolsMapIntoSessionOptions(t *testing.T) {
 	}
 }
 
+func TestOpenAIToolChoiceDoesNotDisableNativeCopilotTools(t *testing.T) {
+	provider := &fakeProvider{
+		nextSession: &fakeSession{
+			id:       "tool-choice-native-session",
+			deltas:   []string{"ok"},
+			response: "ok",
+			usage: gatewayruntime.Usage{
+				InputTokens:  4,
+				OutputTokens: 2,
+			},
+		},
+	}
+	server := newTestServer(t, provider)
+
+	body := `{"model":"gpt-4.1","stream":true,"tool_choice":"none","messages":[{"role":"user","content":"Use the tool"}],"tools":[{"type":"function","function":{"name":"lookup_issue"}}],"x_copilot":{"tools":[{"name":"native_lookup","description":"Native tool","parameters":{"type":"object"}}]}}`
+	recorder := performRequest(server, http.MethodPost, "/v1/chat/completions", body, map[string]string{
+		"Authorization": "Bearer test-key",
+		"X-Session-ID":  "tool-choice-native-key",
+	})
+
+	if recorder.Code != http.StatusOK {
+		t.Fatalf("expected 200, got %d: %s", recorder.Code, recorder.Body.String())
+	}
+	if len(provider.sessionOptions) != 1 || len(provider.sessionOptions[0].Tools) != 1 || provider.sessionOptions[0].Tools[0].Name != "native_lookup" {
+		t.Fatalf("expected tool_choice=none to preserve x_copilot.tools, got %#v", provider.sessionOptions)
+	}
+}
+
+func TestOpenAIToolChoiceIgnoresNativeOnlyTools(t *testing.T) {
+	provider := &fakeProvider{
+		nextSession: &fakeSession{
+			id:       "tool-choice-native-only-session",
+			deltas:   []string{"ok"},
+			response: "ok",
+			usage: gatewayruntime.Usage{
+				InputTokens:  4,
+				OutputTokens: 2,
+			},
+		},
+	}
+	server := newTestServer(t, provider)
+
+	body := `{"model":"gpt-4.1","stream":true,"tool_choice":{"type":"function","function":{"name":"native_lookup"}},"messages":[{"role":"user","content":"Use the tool"}],"x_copilot":{"tools":[{"name":"native_lookup","description":"Native tool","parameters":{"type":"object"}}]}}`
+	recorder := performRequest(server, http.MethodPost, "/v1/chat/completions", body, map[string]string{
+		"Authorization": "Bearer test-key",
+		"X-Session-ID":  "tool-choice-native-only-key",
+	})
+
+	if recorder.Code != http.StatusOK {
+		t.Fatalf("expected 200, got %d: %s", recorder.Code, recorder.Body.String())
+	}
+	if len(provider.sessionOptions) != 1 || len(provider.sessionOptions[0].Tools) != 1 || provider.sessionOptions[0].Tools[0].Name != "native_lookup" {
+		t.Fatalf("expected tool_choice to ignore native-only x_copilot.tools, got %#v", provider.sessionOptions)
+	}
+}
+
+func TestOpenAIToolChoiceFiltersSessionTools(t *testing.T) {
+	provider := &fakeProvider{
+		nextSession: &fakeSession{
+			id:       "tool-choice-session",
+			deltas:   []string{"ok"},
+			response: "ok",
+			usage: gatewayruntime.Usage{
+				InputTokens:  4,
+				OutputTokens: 2,
+			},
+		},
+	}
+	server := newTestServer(t, provider)
+
+	body := `{"model":"gpt-4.1","stream":true,"tool_choice":{"type":"function","function":{"name":"lookup_pr"}},"messages":[{"role":"user","content":"Use the tool"}],"tools":[{"type":"function","function":{"name":"lookup_issue"}},{"type":"function","function":{"name":"lookup_pr"}}]}`
+	recorder := performRequest(server, http.MethodPost, "/v1/chat/completions", body, map[string]string{
+		"Authorization": "Bearer test-key",
+		"X-Session-ID":  "tool-choice-key",
+	})
+
+	if recorder.Code != http.StatusOK {
+		t.Fatalf("expected 200, got %d: %s", recorder.Code, recorder.Body.String())
+	}
+	if len(provider.sessionOptions) != 1 || len(provider.sessionOptions[0].Tools) != 1 || provider.sessionOptions[0].Tools[0].Name != "lookup_pr" {
+		t.Fatalf("expected tool_choice to filter tools, got %#v", provider.sessionOptions)
+	}
+}
+
+func TestOpenAIPromptAndModelsFallbackReachSessionOptions(t *testing.T) {
+	provider := &fakeProvider{
+		nextSession: &fakeSession{
+			id:       "prompt-models-session",
+			response: "ok",
+			usage: gatewayruntime.Usage{
+				InputTokens:  4,
+				OutputTokens: 2,
+			},
+		},
+	}
+	server := newTestServer(t, provider)
+
+	body := `{"models":["", "gpt-5.4"],"prompt":"Hello from prompt"}`
+	recorder := performRequest(server, http.MethodPost, "/v1/chat/completions", body, map[string]string{
+		"Authorization": "Bearer test-key",
+	})
+
+	if recorder.Code != http.StatusOK {
+		t.Fatalf("expected 200, got %d: %s", recorder.Code, recorder.Body.String())
+	}
+	if len(provider.sessionOptions) != 1 || provider.sessionOptions[0].Model != "gpt-5.4" {
+		t.Fatalf("expected first non-empty models[] entry to become session model, got %#v", provider.sessionOptions)
+	}
+	if len(provider.createdSessions) != 1 || len(provider.createdSessions[0].prompts) != 1 || !strings.Contains(provider.createdSessions[0].prompts[0], "Hello from prompt") {
+		t.Fatalf("expected prompt fallback to reach session prompt, got %#v", provider.createdSessions)
+	}
+}
+
 func TestPermissionBridgeStreamsPendingRequestAndResumes(t *testing.T) {
 	provider := &permissionBridgeProvider{session: newPermissionBridgeSession("permission-session")}
 	server := newTestServerWithConfig(t, provider, func(cfg *config.Config) {
@@ -542,81 +769,61 @@ func TestPermissionBridgeStreamsPendingRequestAndResumes(t *testing.T) {
 	}
 }
 
-func TestContinuationRefreshesStreamIdleTimeout(t *testing.T) {
-	provider := &permissionBridgeProvider{session: &permissionBridgeSession{
-		id:                 "permission-session",
-		requested:          make(chan struct{}, 1),
-		responses:          make(chan gatewayruntime.PendingResponse, 1),
-		afterResponseDelay: 110 * time.Millisecond,
-	}}
-	server := newTestServerWithConfig(t, provider, func(cfg *config.Config) {
+func TestContinuationResponseTouchesActivityHook(t *testing.T) {
+	server := newTestServerWithConfig(t, &fakeProvider{}, func(cfg *config.Config) {
 		cfg.SDKPermissionMode = gatewayruntime.PermissionModeBridge
-		cfg.StreamIdleTimeout = 150 * time.Millisecond
-		cfg.RequestTimeout = 2 * time.Second
 	})
-	httpServer := httptest.NewServer(server.Handler())
-	defer httpServer.Close()
-
-	body := `{"model":"gpt-4.1","stream":true,"messages":[{"role":"user","content":"Need approval"}],"x_copilot":{"permission_mode":"bridge"}}`
-	resultCh := make(chan string, 1)
-	errCh := make(chan error, 1)
-	go func() {
-		req, err := http.NewRequest(http.MethodPost, httpServer.URL+"/v1/chat/completions", bytes.NewBufferString(body))
-		if err != nil {
-			errCh <- err
-			return
-		}
-		req.Header.Set("Authorization", "Bearer test-key")
-		req.Header.Set("Content-Type", "application/json")
-		req.Header.Set("X-Session-ID", "permission-key")
-		resp, err := http.DefaultClient.Do(req)
-		if err != nil {
-			errCh <- err
-			return
-		}
-		defer resp.Body.Close()
-		payload, err := io.ReadAll(resp.Body)
-		if err != nil {
-			errCh <- err
-			return
-		}
-		resultCh <- string(payload)
-	}()
-
-	select {
-	case <-provider.session.requested:
-	case <-time.After(5 * time.Second):
-		t.Fatal("timed out waiting for permission request")
-	}
-
-	time.Sleep(80 * time.Millisecond)
-
-	continuation := `{"request_id":"perm-1","kind":"permission_result","result_type":"approved"}`
-	request, err := http.NewRequest(http.MethodPost, httpServer.URL+"/v1/copilot/respond", bytes.NewBufferString(continuation))
+	sessionKey := "permission-key"
+	req := httptest.NewRequest(http.MethodPost, "/v1/copilot/respond", nil)
+	req.Header.Set("Authorization", "Bearer test-key")
+	identity, err := server.auth.AuthenticateRequest(req)
 	if err != nil {
-		t.Fatalf("create continuation request: %v", err)
+		t.Fatalf("authenticate request: %v", err)
 	}
-	request.Header.Set("Authorization", "Bearer test-key")
-	request.Header.Set("Content-Type", "application/json")
-	request.Header.Set("X-Session-ID", "permission-key")
-	response, err := http.DefaultClient.Do(request)
+	scopedKey := scopedSessionKey(identity, sessionKey)
+
+	bridgeSession := newPermissionBridgeSession("permission-session")
+	lease, err := server.sessions.Acquire(context.Background(), scopedKey, session.Spec{
+		Model:          "gpt-4.1",
+		PermissionMode: gatewayruntime.PermissionModeBridge,
+	}, func(context.Context) (gatewayruntime.Session, error) {
+		return bridgeSession, nil
+	}, nil, nil)
 	if err != nil {
-		t.Fatalf("send continuation request: %v", err)
+		t.Fatalf("acquire managed session: %v", err)
 	}
-	defer response.Body.Close()
-	if response.StatusCode != http.StatusOK {
-		t.Fatalf("expected continuation to succeed, got %d", response.StatusCode)
+	defer lease.Release()
+
+	activityCh := make(chan struct{}, 1)
+	clearActivity := server.sessions.SetActivityHook(scopedKey, func() {
+		select {
+		case activityCh <- struct{}{}:
+		default:
+		}
+	})
+	defer clearActivity()
+
+	recorder := performRequest(server, http.MethodPost, "/v1/copilot/respond", `{"request_id":"perm-1","kind":"permission_result","result_type":"approved"}`, map[string]string{
+		"Authorization": "Bearer test-key",
+		"X-Session-ID":  sessionKey,
+	})
+	if recorder.Code != http.StatusOK {
+		t.Fatalf("expected continuation to succeed, got %d: %s", recorder.Code, recorder.Body.String())
 	}
 
 	select {
-	case err := <-errCh:
-		t.Fatalf("stream request failed: %v", err)
-	case payload := <-resultCh:
-		if !strings.Contains(payload, `"Done after permission"`) {
-			t.Fatalf("expected stream to survive idle timeout after continuation, got %s", payload)
+	case response := <-bridgeSession.responses:
+		if response.RequestID != "perm-1" || response.Permission == nil || response.Permission.ResultKind != "approved" {
+			t.Fatalf("unexpected continuation payload %#v", response)
 		}
 	case <-time.After(5 * time.Second):
-		t.Fatal("timed out waiting for streamed response")
+		t.Fatal("timed out waiting for continuation payload")
+	}
+
+	select {
+	case <-activityCh:
+	case <-time.After(5 * time.Second):
+		t.Fatal("expected continuation to touch activity hook")
 	}
 }
 
@@ -790,6 +997,37 @@ func TestPersistentSessionRejectsToolConfigurationMismatch(t *testing.T) {
 	}
 }
 
+func TestPersistentSessionRejectsProviderConfigurationMismatch(t *testing.T) {
+	provider := &fakeProvider{}
+	server := newTestServer(t, provider)
+
+	first := `{
+		"model":"custom-model",
+		"messages":[{"role":"user","content":"hello"}],
+		"x_copilot":{"provider":{"type":"openai","base_url":"https://api.openai.com/v1","api_key":"key-a"}}
+	}`
+	firstResponse := performRequest(server, http.MethodPost, "/v1/chat/completions", first, map[string]string{
+		"Authorization": "Bearer test-key",
+		"X-Session-ID":  "provider-session",
+	})
+	if firstResponse.Code != http.StatusOK {
+		t.Fatalf("expected initial provider request to succeed, got %d: %s", firstResponse.Code, firstResponse.Body.String())
+	}
+
+	second := `{
+		"model":"custom-model",
+		"messages":[{"role":"user","content":"hello again"}],
+		"x_copilot":{"provider":{"type":"openai","base_url":"https://api.openai.com/v1","api_key":"key-b"}}
+	}`
+	secondResponse := performRequest(server, http.MethodPost, "/v1/chat/completions", second, map[string]string{
+		"Authorization": "Bearer test-key",
+		"X-Session-ID":  "provider-session",
+	})
+	if secondResponse.Code != http.StatusConflict {
+		t.Fatalf("expected changed provider config to be rejected, got %d: %s", secondResponse.Code, secondResponse.Body.String())
+	}
+}
+
 func TestUnauthorized(t *testing.T) {
 	server := newTestServer(t, &fakeProvider{})
 	recorder := performRequest(server, http.MethodPost, "/v1/chat/completions", `{"messages":[{"role":"user","content":"Hello"}]}`, nil)
@@ -875,6 +1113,125 @@ func TestOpenAIReasoningEffortFlowsToSession(t *testing.T) {
 	}
 	if len(provider.sessionOptions) != 1 || provider.sessionOptions[0].ReasoningEffort != "high" {
 		t.Fatalf("expected reasoning effort to reach session options, got %#v", provider.sessionOptions)
+	}
+}
+
+func TestOpenAIProviderConfigFlowsToSessionOptions(t *testing.T) {
+	provider := &fakeProvider{}
+	server := newTestServer(t, provider)
+
+	recorder := performRequest(server, http.MethodPost, "/v1/chat/completions", `{
+		"model":"custom-model",
+		"messages":[{"role":"user","content":"Hello"}],
+		"x_copilot":{
+			"provider":{
+				"type":"openai",
+				"wire_api":"responses",
+				"base_url":"https://api.openai.com/v1",
+				"api_key":"demo-key"
+			}
+		}
+	}`, map[string]string{
+		"Authorization": "Bearer test-key",
+	})
+	if recorder.Code != http.StatusOK {
+		t.Fatalf("expected 200, got %d: %s", recorder.Code, recorder.Body.String())
+	}
+	if len(provider.sessionOptions) != 1 || provider.sessionOptions[0].Provider == nil {
+		t.Fatalf("expected provider config to reach session options, got %#v", provider.sessionOptions)
+	}
+	got := provider.sessionOptions[0].Provider
+	if got.Type != "openai" || got.WireAPI != "responses" || got.BaseURL != "https://api.openai.com/v1" || got.APIKey != "demo-key" {
+		t.Fatalf("unexpected provider config %#v", got)
+	}
+}
+
+func TestOpenAIProviderConfigBypassesDefaultModelCapabilityValidation(t *testing.T) {
+	provider := &fakeProvider{}
+	server := newTestServer(t, provider)
+
+	recorder := performRequest(server, http.MethodPost, "/v1/chat/completions", `{
+		"model":"unknown-provider-model",
+		"reasoning_effort":"high",
+		"messages":[{"role":"user","content":"Hello"}],
+		"x_copilot":{
+			"provider":{
+				"type":"openai",
+				"base_url":"https://api.openai.com/v1",
+				"api_key":"demo-key"
+			}
+		}
+	}`, map[string]string{
+		"Authorization": "Bearer test-key",
+	})
+	if recorder.Code != http.StatusOK {
+		t.Fatalf("expected custom provider request to bypass default model validation, got %d: %s", recorder.Code, recorder.Body.String())
+	}
+	if len(provider.sessionOptions) != 1 || provider.sessionOptions[0].Provider == nil {
+		t.Fatalf("expected provider config to reach session options, got %#v", provider.sessionOptions)
+	}
+}
+
+func TestOpenAIOpenRouterReasoningEffortFlowsToSession(t *testing.T) {
+	provider := &fakeProvider{
+		models: []gatewayruntime.Model{{
+			ID: "gpt-4.1",
+			Supports: gatewayruntime.ModelSupports{
+				ReasoningEffort: true,
+			},
+			SupportedReasoningEfforts: []string{"low", "medium", "high"},
+		}},
+	}
+	server := newTestServer(t, provider)
+
+	recorder := performRequest(server, http.MethodPost, "/v1/chat/completions", `{"model":"gpt-4.1","reasoning":{"effort":"high"},"messages":[{"role":"user","content":"Hello"}]}`, map[string]string{
+		"Authorization": "Bearer test-key",
+	})
+	if recorder.Code != http.StatusOK {
+		t.Fatalf("expected 200, got %d: %s", recorder.Code, recorder.Body.String())
+	}
+	if len(provider.sessionOptions) != 1 || provider.sessionOptions[0].ReasoningEffort != "high" {
+		t.Fatalf("expected OpenRouter reasoning.effort to reach session options, got %#v", provider.sessionOptions)
+	}
+}
+
+func TestOpenAIUnsupportedCompatibilityFieldsReturn400(t *testing.T) {
+	server := newTestServer(t, &fakeProvider{nextSession: &fakeSession{response: "ok"}})
+	testCases := []string{
+		`{"model":"gpt-4.1","parallel_tool_calls":true,"tools":[{"type":"function","function":{"name":"lookup_issue"}}],"stream":true,"messages":[{"role":"user","content":"Hello"}]}`,
+		`{"model":"gpt-4.1","structured_outputs":true,"messages":[{"role":"user","content":"Hello"}]}`,
+		`{"model":"gpt-4.1","adaptive_thinking":{"enabled":true},"messages":[{"role":"user","content":"Hello"}]}`,
+		`{"model":"gpt-4.1","thinking_budget":2048,"messages":[{"role":"user","content":"Hello"}]}`,
+		`{"model":"gpt-4.1","response_format":{"type":"json_schema","json_schema":{"name":"summary","strict":true,"schema":{"type":"object"}}},"messages":[{"role":"user","content":"Hello"}]}`,
+		`{"model":"gpt-4.1","response_format":{"type":123},"messages":[{"role":"user","content":"Hello"}]}`,
+		`{"model":"gpt-4.1","stream":true,"stream_options":{"include_usage":"true"},"messages":[{"role":"user","content":"Hello"}]}`,
+		`{"model":"gpt-4.1","tool_choice":{"function":{"name":123}},"messages":[{"role":"user","content":"Hello"}]}`,
+		`{"model":"gpt-4.1","tool_choice":{"type":"function"},"messages":[{"role":"user","content":"Hello"}]}`,
+		`{"model":"gpt-4.1","tool_choice":{"function":{}},"messages":[{"role":"user","content":"Hello"}]}`,
+		`{"model":"gpt-4.1","function_call":{"name":123},"messages":[{"role":"user","content":"Hello"}]}`,
+		`{"model":"gpt-4.1","function_call":{"name":""},"messages":[{"role":"user","content":"Hello"}]}`,
+	}
+
+	for _, body := range testCases {
+		recorder := performRequest(server, http.MethodPost, "/v1/chat/completions", body, map[string]string{
+			"Authorization": "Bearer test-key",
+		})
+		if recorder.Code != http.StatusBadRequest {
+			t.Fatalf("expected 400 for unsupported compatibility field, got %d: %s", recorder.Code, recorder.Body.String())
+		}
+		if !strings.Contains(recorder.Body.String(), "unsupported_feature") {
+			t.Fatalf("expected unsupported_feature error, got %s", recorder.Body.String())
+		}
+	}
+}
+
+func TestOpenAIParallelToolCallsFalseIsTolerated(t *testing.T) {
+	server := newTestServer(t, &fakeProvider{nextSession: &fakeSession{response: "ok"}})
+	recorder := performRequest(server, http.MethodPost, "/v1/chat/completions", `{"model":"gpt-4.1","parallel_tool_calls":false,"messages":[{"role":"user","content":"Hello"}]}`, map[string]string{
+		"Authorization": "Bearer test-key",
+	})
+	if recorder.Code != http.StatusOK {
+		t.Fatalf("expected 200 for parallel_tool_calls=false, got %d: %s", recorder.Code, recorder.Body.String())
 	}
 }
 
@@ -1040,6 +1397,46 @@ func TestOpenAIStreamingIncludesCopilotRuntimeEvents(t *testing.T) {
 	}
 }
 
+func TestOpenAIStreamingIncludesStandardReasoningDelta(t *testing.T) {
+	provider := &fakeProvider{
+		nextSession: &fakeSession{
+			id:       "stream-reasoning-standard",
+			deltas:   []string{"Hel", "lo"},
+			response: "Hello",
+			runtimeEvents: []gatewayruntime.Event{
+				{
+					Type:  gatewayruntime.EventReasoningDelta,
+					Delta: "step",
+					Runtime: &gatewayruntime.RuntimeEvent{
+						Type:  string(gatewayruntime.EventReasoningDelta),
+						Delta: "step",
+					},
+				},
+			},
+		},
+	}
+	server := newTestServer(t, provider)
+
+	body := `{
+		"model":"gpt-4.1",
+		"stream":true,
+		"messages":[{"role":"user","content":"Hello"}]
+	}`
+	recorder := performRequest(server, http.MethodPost, "/v1/chat/completions", body, map[string]string{
+		"Authorization": "Bearer test-key",
+	})
+	if recorder.Code != http.StatusOK {
+		t.Fatalf("expected 200, got %d: %s", recorder.Code, recorder.Body.String())
+	}
+	output := recorder.Body.String()
+	if !strings.Contains(output, `"delta":{"reasoning":"step"}`) {
+		t.Fatalf("expected standard OpenAI reasoning delta, got %s", output)
+	}
+	if strings.Contains(output, `"x_copilot":{"event":{"type":"reasoning_delta"`) {
+		t.Fatalf("expected reasoning delta without x_copilot extension by default, got %s", output)
+	}
+}
+
 func TestClaudeJSONIncludesCopilotReasoningExtension(t *testing.T) {
 	provider := &fakeProvider{
 		nextSession: &fakeSession{
@@ -1072,6 +1469,128 @@ func TestClaudeJSONIncludesCopilotReasoningExtension(t *testing.T) {
 	}
 	if response.XCopilot.Reasoning != "thinking" {
 		t.Fatalf("expected Claude response reasoning extension, got %#v", response.XCopilot)
+	}
+}
+
+func TestOpenAIJSONIncludesStandardReasoningField(t *testing.T) {
+	provider := &fakeProvider{
+		nextSession: &fakeSession{
+			id:        "openai-reasoning",
+			response:  "OpenAI reply",
+			reasoning: "thinking trace",
+		},
+	}
+	server := newTestServer(t, provider)
+
+	body := `{
+		"model":"gpt-4.1",
+		"messages":[{"role":"user","content":"Hi"}]
+	}`
+	recorder := performRequest(server, http.MethodPost, "/v1/chat/completions", body, map[string]string{
+		"Authorization": "Bearer test-key",
+	})
+	if recorder.Code != http.StatusOK {
+		t.Fatalf("expected 200, got %d: %s", recorder.Code, recorder.Body.String())
+	}
+	var response struct {
+		Choices []struct {
+			Message struct {
+				Content   string `json:"content"`
+				Reasoning string `json:"reasoning"`
+			} `json:"message"`
+		} `json:"choices"`
+	}
+	if err := json.Unmarshal(recorder.Body.Bytes(), &response); err != nil {
+		t.Fatalf("decode response: %v", err)
+	}
+	if len(response.Choices) != 1 || response.Choices[0].Message.Reasoning != "thinking trace" {
+		t.Fatalf("expected standard reasoning field, got %#v", response.Choices)
+	}
+}
+
+func TestOpenAIRejectsInvalidProviderConfig(t *testing.T) {
+	server := newTestServer(t, &fakeProvider{})
+	recorder := performRequest(server, http.MethodPost, "/v1/chat/completions", `{
+		"model":"gpt-4.1",
+		"messages":[{"role":"user","content":"Hello"}],
+		"x_copilot":{"provider":{"type":"openai","base_url":"not-a-url"}}
+	}`, map[string]string{
+		"Authorization": "Bearer test-key",
+	})
+	if recorder.Code != http.StatusBadRequest {
+		t.Fatalf("expected invalid provider config to return 400, got %d: %s", recorder.Code, recorder.Body.String())
+	}
+}
+
+func TestOpenAIRejectsPrivateProviderBaseURLByDefault(t *testing.T) {
+	server := newTestServer(t, &fakeProvider{})
+	recorder := performRequest(server, http.MethodPost, "/v1/chat/completions", `{
+		"model":"gpt-4.1",
+		"messages":[{"role":"user","content":"Hello"}],
+		"x_copilot":{"provider":{"type":"openai","base_url":"http://127.0.0.1:11434/v1"}}
+	}`, map[string]string{
+		"Authorization": "Bearer test-key",
+	})
+	if recorder.Code != http.StatusBadRequest {
+		t.Fatalf("expected private provider URL to return 400, got %d: %s", recorder.Code, recorder.Body.String())
+	}
+}
+
+func TestOpenAIAllowsPrivateProviderBaseURLWhenConfigured(t *testing.T) {
+	server := newTestServerWithConfig(t, &fakeProvider{}, func(cfg *config.Config) {
+		cfg.AllowPrivateRemoteURLs = true
+	})
+	recorder := performRequest(server, http.MethodPost, "/v1/chat/completions", `{
+		"model":"gpt-4.1",
+		"messages":[{"role":"user","content":"Hello"}],
+		"x_copilot":{"provider":{"type":"openai","base_url":"http://127.0.0.1:11434/v1"}}
+	}`, map[string]string{
+		"Authorization": "Bearer test-key",
+	})
+	if recorder.Code != http.StatusOK {
+		t.Fatalf("expected private provider URL to be allowed when configured, got %d: %s", recorder.Code, recorder.Body.String())
+	}
+}
+
+func TestOpenAIRejectsProviderBaseURLWithoutHost(t *testing.T) {
+	server := newTestServer(t, &fakeProvider{})
+	recorder := performRequest(server, http.MethodPost, "/v1/chat/completions", `{
+		"model":"gpt-4.1",
+		"messages":[{"role":"user","content":"Hello"}],
+		"x_copilot":{"provider":{"type":"openai","base_url":"https:///v1"}}
+	}`, map[string]string{
+		"Authorization": "Bearer test-key",
+	})
+	if recorder.Code != http.StatusBadRequest {
+		t.Fatalf("expected hostless provider URL to return 400, got %d: %s", recorder.Code, recorder.Body.String())
+	}
+}
+
+func TestOpenAIRejectsArbitraryProviderHostnameByDefault(t *testing.T) {
+	server := newTestServer(t, &fakeProvider{})
+	recorder := performRequest(server, http.MethodPost, "/v1/chat/completions", `{
+		"model":"gpt-4.1",
+		"messages":[{"role":"user","content":"Hello"}],
+		"x_copilot":{"provider":{"type":"openai","base_url":"https://example.com/v1"}}
+	}`, map[string]string{
+		"Authorization": "Bearer test-key",
+	})
+	if recorder.Code != http.StatusBadRequest {
+		t.Fatalf("expected arbitrary provider hostname to return 400, got %d: %s", recorder.Code, recorder.Body.String())
+	}
+}
+
+func TestOpenAIRejectsMalformedAzureProviderHostname(t *testing.T) {
+	server := newTestServer(t, &fakeProvider{})
+	recorder := performRequest(server, http.MethodPost, "/v1/chat/completions", `{
+		"model":"gpt-4.1",
+		"messages":[{"role":"user","content":"Hello"}],
+		"x_copilot":{"provider":{"type":"azure","base_url":"https://.openai.azure.com/openai/deployments/test"}}
+	}`, map[string]string{
+		"Authorization": "Bearer test-key",
+	})
+	if recorder.Code != http.StatusBadRequest {
+		t.Fatalf("expected malformed Azure provider hostname to return 400, got %d: %s", recorder.Code, recorder.Body.String())
 	}
 }
 

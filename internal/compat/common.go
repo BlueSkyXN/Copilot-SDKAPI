@@ -48,6 +48,19 @@ type CopilotAttachment struct {
 	URL       string `json:"url,omitempty"`
 }
 
+type CopilotProviderAzureConfig struct {
+	APIVersion string `json:"api_version,omitempty"`
+}
+
+type CopilotProviderConfig struct {
+	Type        string                      `json:"type,omitempty"`
+	WireAPI     string                      `json:"wire_api,omitempty"`
+	BaseURL     string                      `json:"base_url,omitempty"`
+	APIKey      string                      `json:"api_key,omitempty"`
+	BearerToken string                      `json:"bearer_token,omitempty"`
+	Azure       *CopilotProviderAzureConfig `json:"azure,omitempty"`
+}
+
 type CopilotRequestExtension struct {
 	Agent                string                  `json:"agent,omitempty"`
 	SystemMessageMode    string                  `json:"system_message_mode,omitempty"`
@@ -57,6 +70,7 @@ type CopilotRequestExtension struct {
 	PermissionMode       string                  `json:"permission_mode,omitempty"`
 	Tools                []CopilotToolDefinition `json:"tools,omitempty"`
 	Attachments          []CopilotAttachment     `json:"attachments,omitempty"`
+	Provider             *CopilotProviderConfig  `json:"provider,omitempty"`
 }
 
 type CopilotResponseExtension struct {
@@ -67,12 +81,13 @@ type CopilotResponseExtension struct {
 }
 
 type ConversationRequest struct {
-	Model           string
-	SystemPrompt    string
-	ReasoningEffort string
-	Stream          bool
-	Turns           []Turn
-	Copilot         CopilotRequestExtension
+	Model                string
+	SystemPrompt         string
+	ReasoningEffort      string
+	Stream               bool
+	IncludeUsageInStream bool
+	Turns                []Turn
+	Copilot              CopilotRequestExtension
 }
 
 type ImageAttachment struct {
