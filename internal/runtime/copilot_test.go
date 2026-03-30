@@ -115,14 +115,14 @@ func TestInteractiveBridgeRejectsConcurrentPermissionRequests(t *testing.T) {
 	bridge.registerPermissionRequest(copilot.Data{
 		RequestID: ptrTo("perm-1"),
 		PermissionRequest: &copilot.PermissionRequest{
-			Kind:      copilot.KindShell,
+			Kind:      copilot.PermissionRequestKindShell,
 			Intention: ptrTo("first"),
 		},
 	})
 	bridge.registerPermissionRequest(copilot.Data{
 		RequestID: ptrTo("perm-2"),
 		PermissionRequest: &copilot.PermissionRequest{
-			Kind:      copilot.KindShell,
+			Kind:      copilot.PermissionRequestKindShell,
 			Intention: ptrTo("second"),
 		},
 	})

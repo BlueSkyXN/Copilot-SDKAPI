@@ -53,6 +53,7 @@ type Config struct {
 	SDKDefaultAgent        string
 	SDKPermissionMode      gatewayruntime.PermissionMode
 	SDKInfiniteSessions    *gatewayruntime.InfiniteSessionOptions
+	SDKTelemetry           *gatewayruntime.TelemetryOptions
 	APIKeys                []APIKey
 	UsingDefaultAPIKey     bool
 }
@@ -222,6 +223,8 @@ func Load() (Config, error) {
 	cfg.APIKeys = apiKeys
 	cfg.UsingDefaultAPIKey = usingDefaultAPIKey
 
+	cfg.SDKTelemetry = parseTelemetryFromEnv()
+
 	return cfg, nil
 }
 
@@ -310,6 +313,37 @@ func parseThreshold(raw string) (float64, error) {
 		return 0, fmt.Errorf("threshold must be between 0 and 1")
 	}
 	return parsed, nil
+}
+
+func parseTelemetryFromEnv() *gatewayruntime.TelemetryOptions {
+	enabledRaw := strings.TrimSpace(os.Getenv("GATEWAY_OTEL_ENABLED"))
+	endpoint := strings.TrimSpace(os.Getenv("GATEWAY_OTEL_ENDPOINT"))
+	filePath := strings.TrimSpace(os.Getenv("GATEWAY_OTEL_FILE_PATH"))
+	exporterType := strings.TrimSpace(os.Getenv("GATEWAY_OTEL_EXPORTER_TYPE"))
+	sourceName := strings.TrimSpace(os.Getenv("GATEWAY_OTEL_SOURCE_NAME"))
+
+	// No telemetry env vars set at all → disabled.
+	if enabledRaw == "" && endpoint == "" && filePath == "" {
+		return nil
+	}
+
+	// Explicit GATEWAY_OTEL_ENABLED=false disables telemetry even if
+	// endpoint or file path are configured alongside it.
+	if enabledRaw != "" {
+		enabled, _ := strconv.ParseBool(enabledRaw)
+		if !enabled {
+			return nil
+		}
+	}
+
+	// Either GATEWAY_OTEL_ENABLED=true or an endpoint/filePath implicitly enables.
+	return &gatewayruntime.TelemetryOptions{
+		Enabled:      true,
+		Endpoint:     endpoint,
+		FilePath:     filePath,
+		ExporterType: exporterType,
+		SourceName:   sourceName,
+	}
 }
 
 func defaultSessionStorePath() string {

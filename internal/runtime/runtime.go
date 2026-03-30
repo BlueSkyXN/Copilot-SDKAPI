@@ -43,6 +43,14 @@ type ProviderConfig struct {
 	AzureAPIVersion string
 }
 
+type TelemetryOptions struct {
+	Enabled      bool
+	Endpoint     string
+	FilePath     string
+	ExporterType string
+	SourceName   string
+}
+
 type Options struct {
 	CLIPath          string
 	GitHubToken      string
@@ -61,24 +69,34 @@ type Options struct {
 	DefaultAgent     string
 	PermissionMode   PermissionMode
 	InfiniteSessions *InfiniteSessionOptions
+	Telemetry        *TelemetryOptions
+}
+
+type SectionOverride struct {
+	Action  string `json:"action,omitempty"`
+	Content string `json:"content,omitempty"`
 }
 
 type SessionOptions struct {
-	SessionID        string
-	Model            string
-	SystemPrompt     string
-	SystemPromptMode string
-	ReasoningEffort  string
-	Agent            string
-	Interactive      bool
-	Tools            []ToolDefinition
-	PermissionMode   PermissionMode
-	Provider         *ProviderConfig
+	SessionID             string
+	Model                 string
+	SystemPrompt          string
+	SystemPromptMode      string
+	SystemMessageSections map[string]SectionOverride
+	ReasoningEffort       string
+	Agent                 string
+	Interactive           bool
+	Tools                 []ToolDefinition
+	PermissionMode        PermissionMode
+	Provider              *ProviderConfig
 }
 
 type Attachment struct {
 	Path      string
 	MediaType string
+	// BlobData holds base64-encoded inline data for blob attachments.
+	// When set, the attachment is sent as a blob instead of a file reference.
+	BlobData string
 }
 
 type ToolDefinition struct {
@@ -86,6 +104,7 @@ type ToolDefinition struct {
 	Description     string
 	Parameters      map[string]any
 	OverrideBuiltIn bool
+	SkipPermission  bool
 }
 
 type ToolBinaryResult struct {

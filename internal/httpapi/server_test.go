@@ -904,6 +904,9 @@ func TestOpenAIImageURLIsFetchedAndMaterialized(t *testing.T) {
 	if attachment.MediaType != "image/png" {
 		t.Fatalf("unexpected fetched image media type %q", attachment.MediaType)
 	}
+	if attachment.BlobData == "" {
+		t.Fatal("expected blob data to be set for fetched remote image attachment")
+	}
 	content := provider.createdSessions[0].attachmentData[0][0]
 	if len(content) == 0 {
 		t.Fatal("expected fetched image content to be non-empty")
@@ -1637,8 +1640,13 @@ func TestOpenAIImageInputMaterializesAttachment(t *testing.T) {
 	if len(provider.createdSessions) != 1 || len(provider.createdSessions[0].attachments) != 1 || len(provider.createdSessions[0].attachments[0]) != 1 {
 		t.Fatalf("expected one materialized attachment, got %#v", provider.createdSessions)
 	}
-	if _, err := os.Stat(provider.createdSessions[0].attachments[0][0].Path); !errors.Is(err, os.ErrNotExist) {
-		t.Fatalf("expected temporary attachment to be removed after request, stat err=%v", err)
+	attachment := provider.createdSessions[0].attachments[0][0]
+	if attachment.BlobData == "" {
+		t.Fatal("expected blob data to be set for inline image attachment")
+	}
+	content := provider.createdSessions[0].attachmentData[0][0]
+	if len(content) == 0 {
+		t.Fatal("expected inline image content to be non-empty")
 	}
 }
 
@@ -2276,6 +2284,15 @@ func (s *fakeSession) Send(_ context.Context, message gatewayruntime.MessageOpti
 	s.attachments = append(s.attachments, append([]gatewayruntime.Attachment(nil), message.Attachments...))
 	payloads := make([][]byte, 0, len(message.Attachments))
 	for _, attachment := range message.Attachments {
+		if attachment.BlobData != "" {
+			decoded, err := base64.StdEncoding.DecodeString(attachment.BlobData)
+			if err != nil {
+				payloads = append(payloads, nil)
+				continue
+			}
+			payloads = append(payloads, decoded)
+			continue
+		}
 		data, err := os.ReadFile(attachment.Path)
 		if err != nil {
 			payloads = append(payloads, nil)

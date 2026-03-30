@@ -39,7 +39,7 @@
 
 - 静态 API Key 鉴权
 - OpenAI / Claude 文本对话兼容
-- OpenAI / Claude 图片输入兼容（仅最新一条用户消息；支持 inline 与远程 URL 拉取，默认拒绝私网与 special-use 目标）
+- OpenAI / Claude 图片输入兼容（仅最新一条用户消息；支持 inline 与远程 URL 拉取，默认拒绝私网与 special-use 目标）；图片通过 SDK blob attachment 以 inline base64 传输，无需写临时文件到磁盘
 - OpenAI SSE 流式输出
 - OpenAI `stream_options.include_usage` 会在流式结束前追加标准 usage chunk
 - Claude SSE 流式输出
@@ -52,9 +52,11 @@
 - 基于 `X-Session-ID` 的持久会话复用，可跨网关重启恢复
 - 默认拒绝所有工具权限请求；服务端可显式配置为 `bridge` 或 `allow`，请求侧只能在该上限内选择更严格模式
 - 可通过环境变量接入 Copilot SDK 的 Skills / MCP / 工具白名单 / custom agents / infinite sessions 配置
-- 可通过 `x_copilot.agent` 与 `x_copilot.system_message_mode` 选择 custom agent 或切换 system message append / replace
-- 可通过 `x_copilot.tools`、`x_copilot.interactive`、`x_copilot.permission_mode` 与 `/v1/copilot/respond` 暴露 SDK-native tools / ask_user / permission 交互能力
+- 可通过 `x_copilot.agent` 与 `x_copilot.system_message_mode` 选择 custom agent 或切换 system message append / replace / customize
+- `x_copilot.system_message_mode` 支持 `customize` 模式：通过 `x_copilot.system_message_sections` 可对 9 个 CLI 系统提示词分段（identity / tone / tool_efficiency / environment_context / code_change_rules / guidelines / safety / tool_instructions / custom_instructions）分别执行 replace / remove / append / prepend 操作
+- 可通过 `x_copilot.tools`、`x_copilot.interactive`、`x_copilot.permission_mode` 与 `/v1/copilot/respond` 暴露 SDK-native tools / ask_user / permission 交互能力；工具定义支持 `skip_permission` 字段跳过权限检查
 - 可通过 `x_copilot.attachments` 上传通用文件附件
+- 可通过 `GATEWAY_OTEL_*` 环境变量启用 OpenTelemetry 集成（需 SDK 支持 OTLP 或 file exporter）
 - Release 构建时自动通过 bundler 为目标平台生成 embedded Copilot CLI
 
 ## 当前限制

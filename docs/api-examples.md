@@ -391,6 +391,7 @@ curl http://127.0.0.1:38095/v1/chat/completions \
       {
         "name": "lookup_issue",
         "description": "Fetch issue details",
+        "skip_permission": true,
         "parameters": {
           "type": "object",
           "properties": {
@@ -411,15 +412,31 @@ curl http://127.0.0.1:38095/v1/chat/completions \
 }
 ```
 
+customize mode 示例（分段覆盖系统提示词）：
+
+```json
+{
+  "x_copilot": {
+    "system_message_mode": "customize",
+    "system_message_sections": {
+      "identity": {"action": "replace", "content": "You are a senior Go code reviewer."},
+      "tone": {"action": "append", "content": "\nAlways be constructive and specific."},
+      "safety": {"action": "remove"}
+    }
+  }
+}
+```
+
 - `agent`：选择已通过 `GATEWAY_SDK_CUSTOM_AGENTS_JSON` 注册的 custom agent
-- `system_message_mode`：`append`（默认）或 `replace`
+- `system_message_mode`：`append`（默认）、`replace` 或 `customize`
+- `system_message_sections`：仅在 `system_message_mode` 为 `customize` 时使用。对 CLI 系统提示词的各个分段进行细粒度覆盖。支持 9 个分段 ID：`identity`、`tone`、`tool_efficiency`、`environment_context`、`code_change_rules`、`guidelines`、`safety`、`tool_instructions`、`custom_instructions`。每个分段支持 4 种操作：`replace`、`remove`、`append`、`prepend`
 - `include_reasoning`：额外在非流式响应的 `x_copilot.reasoning` 中返回 reasoning；流式时仍会补充 `x_copilot` reasoning 事件。OpenAI 标准 `message.reasoning` / `delta.reasoning` 镜像不依赖这个开关
 - `include_runtime_events`：在非流式响应的 `x_copilot.runtime_events` 返回运行时事件；流式时输出额外的 `x_copilot` 事件帧
 - `interactive`：开启 northbound interactive bridge；要求 `stream=true`，并且初始请求必须携带 `X-Session-ID`
 - `permission_mode`：`inherit`（默认，跟随 `GATEWAY_SDK_PERMISSION_MODE`）、`deny`、`bridge`、`allow`；但请求值不能比服务端 `GATEWAY_SDK_PERMISSION_MODE` 更宽松。`bridge` 会把权限请求桥接到 `/v1/copilot/respond`
 - `provider`：透传官方 SDK 支持的 custom provider / BYOK 配置。当前支持 `type=openai|azure|anthropic`，`base_url` 必填；`wire_api` 仅适用于 openai/azure（默认 `completions`），`type` 省略时默认 `openai`
 - 安全边界：官方 trusted provider host（`api.openai.com`、`api.anthropic.com`、`*.openai.azure.com`）默认允许；任意其它自定义 hostname 目前不支持。如果你要连 `localhost`、私网或 special-use 地址（如本地 Ollama / vLLM），请直接使用 IP literal，并额外设置 `GATEWAY_ALLOW_PRIVATE_REMOTE_URLS=true`
-- `tools`：注册 SDK-native custom tools；OpenAI / Claude 顶层标准 tools 当前都会桥接到这里，但 continuation 仍不伪装成标准无状态 `tool_calls` / `tool_use`
+- `tools`：注册 SDK-native custom tools；支持 `skip_permission: true` 跳过权限检查。OpenAI / Claude 顶层标准 tools 当前都会桥接到这里，但 continuation 仍不伪装成标准无状态 `tool_calls` / `tool_use`
 - `attachments`：上传附加文件，支持 inline `text`、base64 `data` 或远程 `url`
 
 如果显式提供了 `x_copilot.provider`，网关会把 `reasoning_effort` / 图片输入这类能力判断委托给该 provider，而不是继续依赖默认 `/v1/models` 目录。因此 `/v1/models` 仍只代表当前默认 Copilot SDK / CLI 运行时视角，不会自动枚举你临时指定的外部 provider 模型目录。

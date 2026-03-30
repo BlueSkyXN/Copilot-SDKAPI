@@ -114,6 +114,11 @@
 | `GATEWAY_SDK_INFINITE_SESSIONS_ENABLED` | 空，沿用 SDK 默认 | 仅在显式设置时覆盖 SDK 的 infinite sessions 开关。 |
 | `GATEWAY_SDK_INFINITE_SESSIONS_BACKGROUND_COMPACTION_THRESHOLD` | 空，沿用 SDK 默认 | 仅在显式设置时覆盖后台压缩阈值。 |
 | `GATEWAY_SDK_INFINITE_SESSIONS_BUFFER_EXHAUSTION_THRESHOLD` | 空，沿用 SDK 默认 | 仅在显式设置时覆盖 buffer exhaustion 阈值。 |
+| `GATEWAY_OTEL_ENABLED` | 空 | 设置为 `true` 启用 OpenTelemetry 集成。也可通过设置 endpoint 或 file path 隐式启用。 |
+| `GATEWAY_OTEL_ENDPOINT` | 空 | OTLP HTTP 端点 URL，用于 trace/metric 导出。 |
+| `GATEWAY_OTEL_FILE_PATH` | 空 | JSON-lines trace 输出文件路径。 |
+| `GATEWAY_OTEL_EXPORTER_TYPE` | 空 | 导出后端类型：`otlp-http` 或 `file`。 |
+| `GATEWAY_OTEL_SOURCE_NAME` | 空 | instrumentation scope 名称。 |
 
 ## 建议
 

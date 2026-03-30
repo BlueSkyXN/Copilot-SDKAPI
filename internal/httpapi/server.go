@@ -447,31 +447,34 @@ func (s *Server) prepareConversation(ctx context.Context, externalSessionKey str
 		ProviderFingerprint:       providerFingerprint,
 		ProviderSecretFingerprint: providerSecretFingerprint,
 	}
+	systemMessageSections := toRuntimeSectionOverrides(request.Copilot.SystemMessageSections)
 	lease, err := s.sessions.Acquire(ctx, externalSessionKey, spec, func(factoryCtx context.Context) (gatewayruntime.Session, error) {
 		return s.provider.NewSession(factoryCtx, gatewayruntime.SessionOptions{
-			SessionID:        externalSessionKey,
-			Model:            model,
-			SystemPrompt:     request.SystemPrompt,
-			SystemPromptMode: systemMessageMode,
-			ReasoningEffort:  request.ReasoningEffort,
-			Agent:            agent,
-			Interactive:      request.Copilot.Interactive,
-			Tools:            runtimeTools,
-			PermissionMode:   permissionMode,
-			Provider:         runtimeProvider,
+			SessionID:             externalSessionKey,
+			Model:                 model,
+			SystemPrompt:          request.SystemPrompt,
+			SystemPromptMode:      systemMessageMode,
+			SystemMessageSections: systemMessageSections,
+			ReasoningEffort:       request.ReasoningEffort,
+			Agent:                 agent,
+			Interactive:           request.Copilot.Interactive,
+			Tools:                 runtimeTools,
+			PermissionMode:        permissionMode,
+			Provider:              runtimeProvider,
 		})
 	}, func(factoryCtx context.Context, sessionID string) (gatewayruntime.Session, error) {
 		return s.provider.ResumeSession(factoryCtx, sessionID, gatewayruntime.SessionOptions{
-			SessionID:        sessionID,
-			Model:            model,
-			SystemPrompt:     request.SystemPrompt,
-			SystemPromptMode: systemMessageMode,
-			ReasoningEffort:  request.ReasoningEffort,
-			Agent:            agent,
-			Interactive:      request.Copilot.Interactive,
-			Tools:            runtimeTools,
-			PermissionMode:   permissionMode,
-			Provider:         runtimeProvider,
+			SessionID:             sessionID,
+			Model:                 model,
+			SystemPrompt:          request.SystemPrompt,
+			SystemPromptMode:      systemMessageMode,
+			SystemMessageSections: systemMessageSections,
+			ReasoningEffort:       request.ReasoningEffort,
+			Agent:                 agent,
+			Interactive:           request.Copilot.Interactive,
+			Tools:                 runtimeTools,
+			PermissionMode:        permissionMode,
+			Provider:              runtimeProvider,
 		})
 	}, s.provider.DeleteSession)
 	if err != nil {
@@ -735,7 +738,7 @@ func (s *Server) buildCopilotResponseExtension(prepared *preparedConversation, r
 		if prepared.agent != "" {
 			extension.Agent = prepared.agent
 		}
-		if prepared.systemMessageMode == "replace" {
+		if prepared.systemMessageMode == "replace" || prepared.systemMessageMode == "customize" {
 			extension.SystemMessageMode = prepared.systemMessageMode
 		}
 	}
@@ -1047,12 +1050,15 @@ func validateAnthropicVersion(value string) error {
 func (s *Server) validateConversationFeatures(ctx context.Context, modelID string, request compat.ConversationRequest) error {
 	systemMessageMode := effectiveSystemMessageMode(request.Copilot.SystemMessageMode)
 	switch systemMessageMode {
-	case "append", "replace":
+	case "append", "replace", "customize":
 	default:
 		return fmt.Errorf("%w: %s", errInvalidSystemMessageMode, request.Copilot.SystemMessageMode)
 	}
 	if systemMessageMode == "replace" && strings.TrimSpace(request.SystemPrompt) == "" {
 		return fmt.Errorf("%w: replace mode requires a non-empty system prompt", errInvalidSystemMessageMode)
+	}
+	if systemMessageMode == "customize" && len(request.Copilot.SystemMessageSections) == 0 {
+		return fmt.Errorf("%w: customize mode requires at least one section override in x_copilot.system_message_sections", errInvalidSystemMessageMode)
 	}
 	if agent := strings.TrimSpace(request.Copilot.Agent); agent != "" && !s.hasCustomAgent(agent) {
 		return fmt.Errorf("%w: %s", errUnknownAgent, agent)
@@ -1200,11 +1206,27 @@ func effectiveSystemMessageMode(mode string) string {
 	switch strings.ToLower(strings.TrimSpace(mode)) {
 	case "replace":
 		return "replace"
+	case "customize":
+		return "customize"
 	case "", "append":
 		return "append"
 	default:
 		return strings.ToLower(strings.TrimSpace(mode))
 	}
+}
+
+func toRuntimeSectionOverrides(sections map[string]compat.CopilotSectionOverride) map[string]gatewayruntime.SectionOverride {
+	if len(sections) == 0 {
+		return nil
+	}
+	result := make(map[string]gatewayruntime.SectionOverride, len(sections))
+	for k, v := range sections {
+		result[k] = gatewayruntime.SectionOverride{
+			Action:  v.Action,
+			Content: v.Content,
+		}
+	}
+	return result
 }
 
 func effectiveAgent(requestAgent, defaultAgent string) string {
@@ -1250,6 +1272,7 @@ func hasCopilotRequestExtension(extension compat.CopilotRequestExtension) bool {
 		extension.Provider != nil ||
 		len(extension.Attachments) > 0 ||
 		len(extension.Tools) > 0 ||
+		len(extension.SystemMessageSections) > 0 ||
 		strings.TrimSpace(extension.Agent) != "" ||
 		strings.TrimSpace(extension.SystemMessageMode) != ""
 }
@@ -1269,6 +1292,7 @@ func toRuntimeTools(definitions []compat.CopilotToolDefinition) []gatewayruntime
 			Description:     definition.Description,
 			Parameters:      parameters,
 			OverrideBuiltIn: definition.OverrideBuiltIn,
+			SkipPermission:  definition.SkipPermission,
 		})
 	}
 	return tools
@@ -1401,38 +1425,63 @@ func (s *Server) materializeAttachments(ctx context.Context, images []compat.Ima
 		return nil, nil, nil
 	}
 
-	dir, err := os.MkdirTemp("", "copilot-sdkapi-images-*")
-	if err != nil {
-		return nil, nil, err
+	var dir string
+	var dirErr error
+	ensureDir := func() (string, error) {
+		if dir == "" && dirErr == nil {
+			dir, dirErr = os.MkdirTemp("", "copilot-sdkapi-images-*")
+		}
+		return dir, dirErr
 	}
 
-	cleanup := func() error {
-		if err := os.RemoveAll(dir); err != nil && !errors.Is(err, os.ErrNotExist) {
-			return err
-		}
-		return nil
-	}
 	attachments := make([]gatewayruntime.Attachment, 0, len(images))
 	for _, image := range images {
 		mediaType := image.MediaType
 		data := image.Data
-		nameHint := "image"
+
 		if strings.TrimSpace(image.URL) != "" {
 			fetchedType, fetchedData, fetchedName, err := s.fetchRemoteAttachment(ctx, image.URL)
 			if err != nil {
-				_ = cleanup()
+				if dir != "" {
+					_ = os.RemoveAll(dir)
+				}
 				return nil, nil, err
 			}
 			mediaType = fetchedType
 			data = fetchedData
-			nameHint = fetchedName
+			_ = fetchedName
 		}
-		attachment, err := writeAttachmentFile(dir, nameHint, mediaType, data)
+
+		// Use blob attachment for inline base64 data (avoids disk I/O)
+		if len(data) > 0 {
+			encoded := base64.StdEncoding.EncodeToString(data)
+			attachments = append(attachments, gatewayruntime.Attachment{
+				MediaType: mediaType,
+				BlobData:  encoded,
+			})
+			continue
+		}
+
+		// Fallback to file-based attachment
+		d, err := ensureDir()
 		if err != nil {
-			_ = cleanup()
+			return nil, nil, err
+		}
+		attachment, err := writeAttachmentFile(d, "image", mediaType, data)
+		if err != nil {
+			_ = os.RemoveAll(d)
 			return nil, nil, err
 		}
 		attachments = append(attachments, attachment)
+	}
+
+	cleanup := func() error {
+		if dir != "" {
+			if err := os.RemoveAll(dir); err != nil && !errors.Is(err, os.ErrNotExist) {
+				return err
+			}
+		}
+		return nil
 	}
 	return attachments, cleanup, nil
 }
@@ -1765,11 +1814,21 @@ func (s *Server) validateMaterializedImageAttachments(ctx context.Context, model
 	}
 	if limit := model.Limits.Vision.MaxPromptImageSize; limit > 0 {
 		for _, attachment := range attachments {
-			info, err := os.Stat(attachment.Path)
-			if err != nil {
-				return err
+			var size int64
+			if attachment.BlobData != "" {
+				decoded, err := base64.StdEncoding.DecodeString(attachment.BlobData)
+				if err != nil {
+					return err
+				}
+				size = int64(len(decoded))
+			} else {
+				info, err := os.Stat(attachment.Path)
+				if err != nil {
+					return err
+				}
+				size = info.Size()
 			}
-			if info.Size() > int64(limit) {
+			if size > int64(limit) {
 				return fmt.Errorf("%w: image exceeds max_prompt_image_size", errModelLimitsExceeded)
 			}
 		}

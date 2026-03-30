@@ -38,6 +38,7 @@ type CopilotToolDefinition struct {
 	Description     string         `json:"description,omitempty"`
 	Parameters      map[string]any `json:"parameters,omitempty"`
 	OverrideBuiltIn bool           `json:"override_builtin,omitempty"`
+	SkipPermission  bool           `json:"skip_permission,omitempty"`
 }
 
 type CopilotAttachment struct {
@@ -61,16 +62,22 @@ type CopilotProviderConfig struct {
 	Azure       *CopilotProviderAzureConfig `json:"azure,omitempty"`
 }
 
+type CopilotSectionOverride struct {
+	Action  string `json:"action,omitempty"`
+	Content string `json:"content,omitempty"`
+}
+
 type CopilotRequestExtension struct {
-	Agent                string                  `json:"agent,omitempty"`
-	SystemMessageMode    string                  `json:"system_message_mode,omitempty"`
-	IncludeReasoning     bool                    `json:"include_reasoning,omitempty"`
-	IncludeRuntimeEvents bool                    `json:"include_runtime_events,omitempty"`
-	Interactive          bool                    `json:"interactive,omitempty"`
-	PermissionMode       string                  `json:"permission_mode,omitempty"`
-	Tools                []CopilotToolDefinition `json:"tools,omitempty"`
-	Attachments          []CopilotAttachment     `json:"attachments,omitempty"`
-	Provider             *CopilotProviderConfig  `json:"provider,omitempty"`
+	Agent                 string                            `json:"agent,omitempty"`
+	SystemMessageMode     string                            `json:"system_message_mode,omitempty"`
+	SystemMessageSections map[string]CopilotSectionOverride `json:"system_message_sections,omitempty"`
+	IncludeReasoning      bool                              `json:"include_reasoning,omitempty"`
+	IncludeRuntimeEvents  bool                              `json:"include_runtime_events,omitempty"`
+	Interactive           bool                              `json:"interactive,omitempty"`
+	PermissionMode        string                            `json:"permission_mode,omitempty"`
+	Tools                 []CopilotToolDefinition           `json:"tools,omitempty"`
+	Attachments           []CopilotAttachment               `json:"attachments,omitempty"`
+	Provider              *CopilotProviderConfig            `json:"provider,omitempty"`
 }
 
 type CopilotResponseExtension struct {

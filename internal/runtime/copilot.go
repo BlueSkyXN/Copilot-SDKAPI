@@ -10,7 +10,6 @@ import (
 	"time"
 
 	copilot "github.com/github/copilot-sdk/go"
-	"github.com/github/copilot-sdk/go/rpc"
 )
 
 type copilotProvider struct {
@@ -66,13 +65,22 @@ func (p *copilotProvider) Start(ctx context.Context) error {
 		return nil
 	}
 
-	client := copilot.NewClient(&copilot.ClientOptions{
+	opts := &copilot.ClientOptions{
 		CLIPath:         p.options.CLIPath,
 		LogLevel:        p.options.LogLevel,
 		Cwd:             p.options.WorkingDirectory,
 		GitHubToken:     p.options.GitHubToken,
 		UseLoggedInUser: copilot.Bool(p.options.UseLoggedInUser),
-	})
+	}
+	if t := p.options.Telemetry; t != nil && t.Enabled {
+		opts.Telemetry = &copilot.TelemetryConfig{
+			OTLPEndpoint: t.Endpoint,
+			FilePath:     t.FilePath,
+			ExporterType: t.ExporterType,
+			SourceName:   t.SourceName,
+		}
+	}
+	client := copilot.NewClient(opts)
 	if err := client.Start(ctx); err != nil {
 		return fmt.Errorf("start copilot client: %w", err)
 	}
@@ -201,7 +209,20 @@ func (p *copilotProvider) NewSession(ctx context.Context, options SessionOptions
 			BufferExhaustionThreshold:     p.options.InfiniteSessions.BufferExhaustionThreshold,
 		}
 	}
-	if options.SystemPrompt != "" {
+	if options.SystemPromptMode == "customize" && len(options.SystemMessageSections) > 0 {
+		sections := make(map[string]copilot.SectionOverride, len(options.SystemMessageSections))
+		for k, v := range options.SystemMessageSections {
+			sections[k] = copilot.SectionOverride{
+				Action:  copilot.SectionOverrideAction(v.Action),
+				Content: v.Content,
+			}
+		}
+		config.SystemMessage = &copilot.SystemMessageConfig{
+			Mode:     "customize",
+			Content:  options.SystemPrompt,
+			Sections: sections,
+		}
+	} else if options.SystemPrompt != "" {
 		config.SystemMessage = &copilot.SystemMessageConfig{
 			Mode:    normalizeSystemMessageMode(options.SystemPromptMode),
 			Content: options.SystemPrompt,
@@ -213,16 +234,13 @@ func (p *copilotProvider) NewSession(ctx context.Context, options SessionOptions
 	if options.Interactive {
 		config.OnUserInputRequest = bridge.handleUserInput
 	}
+	if agentName != "" {
+		config.Agent = agentName
+	}
 
 	session, err := client.CreateSession(ctx, config)
 	if err != nil {
 		return nil, fmt.Errorf("create copilot session: %w", err)
-	}
-	if agentName != "" {
-		if _, err := session.RPC.Agent.Select(ctx, &rpc.SessionAgentSelectParams{Name: agentName}); err != nil {
-			_ = session.Disconnect()
-			return nil, fmt.Errorf("select agent %q: %w", agentName, err)
-		}
 	}
 	return &copilotSession{session: session, bridge: bridge}, nil
 }
@@ -273,7 +291,20 @@ func (p *copilotProvider) ResumeSession(ctx context.Context, sessionID string, o
 			BufferExhaustionThreshold:     p.options.InfiniteSessions.BufferExhaustionThreshold,
 		}
 	}
-	if options.SystemPrompt != "" {
+	if options.SystemPromptMode == "customize" && len(options.SystemMessageSections) > 0 {
+		sections := make(map[string]copilot.SectionOverride, len(options.SystemMessageSections))
+		for k, v := range options.SystemMessageSections {
+			sections[k] = copilot.SectionOverride{
+				Action:  copilot.SectionOverrideAction(v.Action),
+				Content: v.Content,
+			}
+		}
+		config.SystemMessage = &copilot.SystemMessageConfig{
+			Mode:     "customize",
+			Content:  options.SystemPrompt,
+			Sections: sections,
+		}
+	} else if options.SystemPrompt != "" {
 		config.SystemMessage = &copilot.SystemMessageConfig{
 			Mode:    normalizeSystemMessageMode(options.SystemPromptMode),
 			Content: options.SystemPrompt,
@@ -285,16 +316,13 @@ func (p *copilotProvider) ResumeSession(ctx context.Context, sessionID string, o
 	if options.Interactive {
 		config.OnUserInputRequest = bridge.handleUserInput
 	}
+	if agentName != "" {
+		config.Agent = agentName
+	}
 
 	session, err := client.ResumeSession(ctx, sessionID, config)
 	if err != nil {
 		return nil, wrapSessionLookupError(fmt.Errorf("resume copilot session %q: %w", sessionID, err))
-	}
-	if agentName != "" {
-		if _, err := session.RPC.Agent.Select(ctx, &rpc.SessionAgentSelectParams{Name: agentName}); err != nil {
-			_ = session.Disconnect()
-			return nil, fmt.Errorf("select agent %q: %w", agentName, err)
-		}
 	}
 	return &copilotSession{session: session, bridge: bridge}, nil
 }
@@ -375,7 +403,7 @@ func (s *copilotSession) Send(ctx context.Context, message MessageOptions, handl
 
 	unsubscribe := s.session.On(func(event copilot.SessionEvent) {
 		switch event.Type {
-		case copilot.ExternalToolRequested:
+		case copilot.SessionEventTypeExternalToolRequested:
 			if s.bridge != nil {
 				s.bridge.registerExternalToolRequest(event.Data)
 			}
@@ -386,11 +414,11 @@ func (s *copilotSession) Send(ctx context.Context, message MessageOptions, handl
 				ToolName:  deref(event.Data.ToolName),
 				Arguments: event.Data.Arguments,
 			}})
-		case copilot.ExternalToolCompleted:
+		case copilot.SessionEventTypeExternalToolCompleted:
 			if s.bridge != nil {
 				s.bridge.forgetRequest(deref(event.Data.RequestID))
 			}
-		case copilot.AssistantMessageDelta:
+		case copilot.SessionEventTypeAssistantMessageDelta:
 			delta := deref(event.Data.DeltaContent)
 			if delta == "" {
 				return
@@ -399,7 +427,7 @@ func (s *copilotSession) Send(ctx context.Context, message MessageOptions, handl
 			contentBuf.WriteString(delta)
 			stateMu.Unlock()
 			dispatch(Event{Type: EventMessageDelta, Delta: delta})
-		case copilot.AssistantMessage:
+		case copilot.SessionEventTypeAssistantMessage:
 			content := deref(event.Data.Content)
 			if content == "" {
 				return
@@ -408,7 +436,7 @@ func (s *copilotSession) Send(ctx context.Context, message MessageOptions, handl
 			finalText = content
 			stateMu.Unlock()
 			dispatch(Event{Type: EventMessage, Content: content})
-		case copilot.AssistantReasoningDelta:
+		case copilot.SessionEventTypeAssistantReasoningDelta:
 			delta := firstNonEmpty(deref(event.Data.DeltaContent), deref(event.Data.ReasoningText))
 			if delta == "" {
 				return
@@ -417,7 +445,7 @@ func (s *copilotSession) Send(ctx context.Context, message MessageOptions, handl
 			reasoningBuf.WriteString(delta)
 			stateMu.Unlock()
 			dispatch(Event{Type: EventReasoningDelta, Runtime: &RuntimeEvent{Type: string(EventReasoningDelta), Delta: delta}})
-		case copilot.AssistantReasoning:
+		case copilot.SessionEventTypeAssistantReasoning:
 			content := firstNonEmpty(deref(event.Data.Content), deref(event.Data.ReasoningText))
 			if content == "" {
 				stateMu.Lock()
@@ -428,7 +456,7 @@ func (s *copilotSession) Send(ctx context.Context, message MessageOptions, handl
 				return
 			}
 			dispatch(Event{Type: EventReasoning, Runtime: &RuntimeEvent{Type: string(EventReasoning), Content: content}})
-		case copilot.ToolExecutionStart:
+		case copilot.SessionEventTypeToolExecutionStart:
 			dispatch(Event{Type: EventToolExecutionStart, Runtime: &RuntimeEvent{
 				Type:          string(EventToolExecutionStart),
 				CallID:        deref(event.Data.ToolCallID),
@@ -437,7 +465,7 @@ func (s *copilotSession) Send(ctx context.Context, message MessageOptions, handl
 				MCPToolName:   deref(event.Data.MCPToolName),
 				Arguments:     event.Data.Arguments,
 			}})
-		case copilot.ToolExecutionComplete:
+		case copilot.SessionEventTypeToolExecutionComplete:
 			dispatch(Event{Type: EventToolExecutionComplete, Runtime: &RuntimeEvent{
 				Type:           string(EventToolExecutionComplete),
 				CallID:         deref(event.Data.ToolCallID),
@@ -451,7 +479,7 @@ func (s *copilotSession) Send(ctx context.Context, message MessageOptions, handl
 				Telemetry:      cloneMap(event.Data.ToolTelemetry),
 				Content:        errorUnionMessage(event.Data.Error),
 			}})
-		case copilot.PermissionRequested:
+		case copilot.SessionEventTypePermissionRequested:
 			if s.bridge != nil {
 				s.bridge.registerPermissionRequest(event.Data)
 			}
@@ -461,7 +489,7 @@ func (s *copilotSession) Send(ctx context.Context, message MessageOptions, handl
 				CallID:            deref(event.Data.ToolCallID),
 				PermissionRequest: permissionSummary(event.Data.PermissionRequest),
 			}})
-		case copilot.PermissionCompleted:
+		case copilot.SessionEventTypePermissionCompleted:
 			if s.bridge != nil {
 				s.bridge.forgetRequest(deref(event.Data.RequestID))
 			}
@@ -469,7 +497,7 @@ func (s *copilotSession) Send(ctx context.Context, message MessageOptions, handl
 				Type:      string(EventPermissionCompleted),
 				RequestID: deref(event.Data.RequestID),
 			}})
-		case copilot.UserInputRequested:
+		case copilot.SessionEventTypeUserInputRequested:
 			if s.bridge != nil {
 				s.bridge.registerUserInputRequest(event.Data)
 			}
@@ -478,13 +506,13 @@ func (s *copilotSession) Send(ctx context.Context, message MessageOptions, handl
 				RequestID:        deref(event.Data.RequestID),
 				UserInputRequest: userInputSummary(event.Data),
 			}})
-		case copilot.UserInputCompleted:
+		case copilot.SessionEventTypeUserInputCompleted:
 			if s.bridge != nil {
 				s.bridge.forgetRequest(deref(event.Data.RequestID))
 			}
-		case copilot.SessionCompactionStart:
+		case copilot.SessionEventTypeSessionCompactionStart:
 			dispatch(Event{Type: EventSessionCompactionStart, Runtime: &RuntimeEvent{Type: string(EventSessionCompactionStart)}})
-		case copilot.SessionCompactionComplete:
+		case copilot.SessionEventTypeSessionCompactionComplete:
 			dispatch(Event{Type: EventSessionCompactionComplete, Runtime: &RuntimeEvent{
 				Type:           string(EventSessionCompactionComplete),
 				SummaryContent: deref(event.Data.SummaryContent),
@@ -492,20 +520,20 @@ func (s *copilotSession) Send(ctx context.Context, message MessageOptions, handl
 				Success:        boolPtr(event.Data.Success),
 				Content:        errorUnionMessage(event.Data.Error),
 			}})
-		case copilot.SystemMessage:
+		case copilot.SessionEventTypeSystemMessage:
 			dispatch(Event{Type: EventSystemMessage, Runtime: &RuntimeEvent{
 				Type:    string(EventSystemMessage),
 				Role:    enumString(event.Data.Role),
 				Content: deref(event.Data.Content),
 				Name:    deref(event.Data.Name),
 			}})
-		case copilot.SkillInvoked:
+		case copilot.SessionEventTypeSkillInvoked:
 			dispatch(Event{Type: EventSkillInvoked, Runtime: &RuntimeEvent{
 				Type:         string(EventSkillInvoked),
 				Name:         deref(event.Data.Name),
 				AllowedTools: append([]string(nil), event.Data.AllowedTools...),
 			}})
-		case copilot.SubagentSelected:
+		case copilot.SessionEventTypeSubagentSelected:
 			dispatch(Event{Type: EventSubagentSelected, Runtime: &RuntimeEvent{
 				Type:             string(EventSubagentSelected),
 				AgentName:        deref(event.Data.AgentName),
@@ -513,7 +541,7 @@ func (s *copilotSession) Send(ctx context.Context, message MessageOptions, handl
 				AgentDescription: deref(event.Data.AgentDescription),
 				AllowedTools:     append([]string(nil), event.Data.Tools...),
 			}})
-		case copilot.AssistantUsage:
+		case copilot.SessionEventTypeAssistantUsage:
 			currentUsage := Usage{
 				InputTokens:      int64FromFloat(event.Data.InputTokens),
 				OutputTokens:     int64FromFloat(event.Data.OutputTokens),
@@ -524,7 +552,7 @@ func (s *copilotSession) Send(ctx context.Context, message MessageOptions, handl
 			usage = currentUsage
 			stateMu.Unlock()
 			dispatch(Event{Type: EventUsage, Usage: currentUsage})
-		case copilot.SessionError:
+		case copilot.SessionEventTypeSessionError:
 			runtimeErr := runtimeErrorFromEvent(event)
 			dispatch(Event{Type: EventError, Err: runtimeErr})
 			cancelSend(runtimeErr)
@@ -532,7 +560,7 @@ func (s *copilotSession) Send(ctx context.Context, message MessageOptions, handl
 			case errCh <- runtimeErr:
 			default:
 			}
-		case copilot.SessionIdle:
+		case copilot.SessionEventTypeSessionIdle:
 			select {
 			case idleCh <- struct{}{}:
 			default:
@@ -557,11 +585,20 @@ func (s *copilotSession) Send(ctx context.Context, message MessageOptions, handl
 		if len(message.Attachments) > 0 {
 			request.Attachments = make([]copilot.Attachment, 0, len(message.Attachments))
 			for _, attachment := range message.Attachments {
-				path := attachment.Path
-				request.Attachments = append(request.Attachments, copilot.Attachment{
-					Type: copilot.File,
-					Path: &path,
-				})
+				if attachment.BlobData != "" {
+					mimeType := attachment.MediaType
+					request.Attachments = append(request.Attachments, copilot.Attachment{
+						Type:     copilot.AttachmentTypeBlob,
+						Data:     &attachment.BlobData,
+						MIMEType: &mimeType,
+					})
+				} else {
+					path := attachment.Path
+					request.Attachments = append(request.Attachments, copilot.Attachment{
+						Type: copilot.AttachmentTypeFile,
+						Path: &path,
+					})
+				}
 			}
 		}
 		_, err := s.session.Send(sendCtx, request)
@@ -887,6 +924,7 @@ func (b *interactiveBridge) buildTools(definitions []ToolDefinition) []copilot.T
 			Description:          definition.Description,
 			Parameters:           cloneMap(definition.Parameters),
 			OverridesBuiltInTool: definition.OverrideBuiltIn,
+			SkipPermission:       definition.SkipPermission,
 			Handler: func(invocation copilot.ToolInvocation) (copilot.ToolResult, error) {
 				return b.awaitToolResult(invocation)
 			},

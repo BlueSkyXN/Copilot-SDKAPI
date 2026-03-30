@@ -54,6 +54,7 @@ func main() {
 		DefaultAgent:     cfg.SDKDefaultAgent,
 		PermissionMode:   cfg.SDKPermissionMode,
 		InfiniteSessions: cfg.SDKInfiniteSessions,
+		Telemetry:        cfg.SDKTelemetry,
 	})
 	if err := provider.Start(ctx); err != nil {
 		logger.Error("failed to start copilot runtime", slog.Any("err", err))
