@@ -44,11 +44,12 @@ type ProviderConfig struct {
 }
 
 type TelemetryOptions struct {
-	Enabled      bool
-	Endpoint     string
-	FilePath     string
-	ExporterType string
-	SourceName   string
+	Enabled        bool
+	Endpoint       string
+	FilePath       string
+	ExporterType   string
+	SourceName     string
+	CaptureContent *bool
 }
 
 type Options struct {
@@ -182,8 +183,19 @@ const (
 	EventSystemMessage             EventType = "system_message"
 	EventSkillInvoked              EventType = "skill_invoked"
 	EventSubagentSelected          EventType = "subagent_selected"
+	EventSubagentStarted           EventType = "subagent_started"
+	EventSubagentCompleted         EventType = "subagent_completed"
+	EventSubagentFailed            EventType = "subagent_failed"
+	EventAssistantIntent           EventType = "assistant_intent"
+	EventAssistantTurnStart        EventType = "assistant_turn_start"
+	EventAssistantTurnEnd          EventType = "assistant_turn_end"
+	EventSessionWarning            EventType = "session_warning"
+	EventSessionModelChange        EventType = "session_model_change"
+	EventToolExecutionProgress     EventType = "tool_execution_progress"
+	EventToolExecutionPartialResult EventType = "tool_execution_partial_result"
 	EventUsage                     EventType = "usage"
 	EventError                     EventType = "error"
+	EventGeneric                   EventType = "generic"
 )
 
 type PermissionRequestSummary struct {
@@ -229,6 +241,14 @@ type RuntimeEvent struct {
 	AgentDisplayName  string                    `json:"agent_display_name,omitempty"`
 	AgentDescription  string                    `json:"agent_description,omitempty"`
 	AllowedTools      []string                  `json:"allowed_tools,omitempty"`
+	TurnID            string                    `json:"turn_id,omitempty"`
+	Model             string                    `json:"model,omitempty"`
+	PreviousModel     string                    `json:"previous_model,omitempty"`
+	DurationMS        float64                   `json:"duration_ms,omitempty"`
+	TotalTokens       int64                     `json:"total_tokens,omitempty"`
+	TotalToolCalls    int64                     `json:"total_tool_calls,omitempty"`
+	// Data holds raw event payload for generic passthrough events.
+	Data              map[string]any            `json:"data,omitempty"`
 }
 
 type Usage struct {

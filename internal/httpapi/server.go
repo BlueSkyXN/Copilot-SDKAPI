@@ -826,6 +826,9 @@ func cloneRuntimeEvent(input *gatewayruntime.RuntimeEvent) *gatewayruntime.Runti
 	}
 	cloned.Arguments = cloneAny(input.Arguments)
 	cloned.AllowedTools = append([]string(nil), input.AllowedTools...)
+	if input.Data != nil {
+		cloned.Data = cloneAny(input.Data).(map[string]any)
+	}
 	return &cloned
 }
 

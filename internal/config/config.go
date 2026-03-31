@@ -321,6 +321,7 @@ func parseTelemetryFromEnv() *gatewayruntime.TelemetryOptions {
 	filePath := strings.TrimSpace(os.Getenv("GATEWAY_OTEL_FILE_PATH"))
 	exporterType := strings.TrimSpace(os.Getenv("GATEWAY_OTEL_EXPORTER_TYPE"))
 	sourceName := strings.TrimSpace(os.Getenv("GATEWAY_OTEL_SOURCE_NAME"))
+	captureContentRaw := strings.TrimSpace(os.Getenv("GATEWAY_OTEL_CAPTURE_CONTENT"))
 
 	// No telemetry env vars set at all → disabled.
 	if enabledRaw == "" && endpoint == "" && filePath == "" {
@@ -337,13 +338,20 @@ func parseTelemetryFromEnv() *gatewayruntime.TelemetryOptions {
 	}
 
 	// Either GATEWAY_OTEL_ENABLED=true or an endpoint/filePath implicitly enables.
-	return &gatewayruntime.TelemetryOptions{
+	opts := &gatewayruntime.TelemetryOptions{
 		Enabled:      true,
 		Endpoint:     endpoint,
 		FilePath:     filePath,
 		ExporterType: exporterType,
 		SourceName:   sourceName,
 	}
+	if captureContentRaw != "" {
+		parsed, err := strconv.ParseBool(captureContentRaw)
+		if err == nil {
+			opts.CaptureContent = &parsed
+		}
+	}
+	return opts
 }
 
 func defaultSessionStorePath() string {

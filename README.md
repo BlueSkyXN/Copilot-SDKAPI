@@ -56,7 +56,8 @@
 - `x_copilot.system_message_mode` 支持 `customize` 模式：通过 `x_copilot.system_message_sections` 可对 9 个 CLI 系统提示词分段（identity / tone / tool_efficiency / environment_context / code_change_rules / guidelines / safety / tool_instructions / custom_instructions）分别执行 replace / remove / append / prepend 操作
 - 可通过 `x_copilot.tools`、`x_copilot.interactive`、`x_copilot.permission_mode` 与 `/v1/copilot/respond` 暴露 SDK-native tools / ask_user / permission 交互能力；工具定义支持 `skip_permission` 字段跳过权限检查
 - 可通过 `x_copilot.attachments` 上传通用文件附件
-- 可通过 `GATEWAY_OTEL_*` 环境变量启用 OpenTelemetry 集成（需 SDK 支持 OTLP 或 file exporter）
+- 可通过 `GATEWAY_OTEL_*` 环境变量启用 OpenTelemetry 集成（需 SDK 支持 OTLP 或 file exporter）；`GATEWAY_OTEL_CAPTURE_CONTENT` 控制是否在 trace 中捕获消息内容
+- SDK 会话事件覆盖率：除核心对话事件外，还为 subagent 生命周期（started/completed/failed）、assistant intent、turn start/end、session warning、model change、tool progress/partial result 提供结构化转发；其余 SDK 事件类型通过 generic passthrough 透传到 `x_copilot` runtime events
 - Release 构建时自动通过 bundler 为目标平台生成 embedded Copilot CLI
 
 ## 当前限制

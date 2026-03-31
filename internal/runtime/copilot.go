@@ -74,10 +74,11 @@ func (p *copilotProvider) Start(ctx context.Context) error {
 	}
 	if t := p.options.Telemetry; t != nil && t.Enabled {
 		opts.Telemetry = &copilot.TelemetryConfig{
-			OTLPEndpoint: t.Endpoint,
-			FilePath:     t.FilePath,
-			ExporterType: t.ExporterType,
-			SourceName:   t.SourceName,
+			OTLPEndpoint:   t.Endpoint,
+			FilePath:       t.FilePath,
+			ExporterType:   t.ExporterType,
+			SourceName:     t.SourceName,
+			CaptureContent: t.CaptureContent,
 		}
 	}
 	client := copilot.NewClient(opts)
@@ -541,6 +542,68 @@ func (s *copilotSession) Send(ctx context.Context, message MessageOptions, handl
 				AgentDescription: deref(event.Data.AgentDescription),
 				AllowedTools:     append([]string(nil), event.Data.Tools...),
 			}})
+		case copilot.SessionEventTypeSubagentStarted:
+			dispatch(Event{Type: EventSubagentStarted, Runtime: &RuntimeEvent{
+				Type:             string(EventSubagentStarted),
+				AgentName:        deref(event.Data.AgentName),
+				AgentDisplayName: deref(event.Data.AgentDisplayName),
+				AgentDescription: deref(event.Data.AgentDescription),
+				AllowedTools:     append([]string(nil), event.Data.Tools...),
+			}})
+		case copilot.SessionEventTypeSubagentCompleted:
+			dispatch(Event{Type: EventSubagentCompleted, Runtime: &RuntimeEvent{
+				Type:      string(EventSubagentCompleted),
+				AgentName: deref(event.Data.AgentName),
+			}})
+		case copilot.SessionEventTypeSubagentFailed:
+			dispatch(Event{Type: EventSubagentFailed, Runtime: &RuntimeEvent{
+				Type:      string(EventSubagentFailed),
+				AgentName: deref(event.Data.AgentName),
+				Content:   errorUnionMessage(event.Data.Error),
+			}})
+		case copilot.SessionEventTypeAssistantIntent:
+			dispatch(Event{Type: EventAssistantIntent, Runtime: &RuntimeEvent{
+				Type:    string(EventAssistantIntent),
+				Content: deref(event.Data.Intent),
+				TurnID:  deref(event.Data.TurnID),
+			}})
+		case copilot.SessionEventTypeAssistantTurnStart:
+			dispatch(Event{Type: EventAssistantTurnStart, Runtime: &RuntimeEvent{
+				Type:   string(EventAssistantTurnStart),
+				TurnID: deref(event.Data.TurnID),
+				Model:  deref(event.Data.Model),
+			}})
+		case copilot.SessionEventTypeAssistantTurnEnd:
+			dispatch(Event{Type: EventAssistantTurnEnd, Runtime: &RuntimeEvent{
+				Type:   string(EventAssistantTurnEnd),
+				TurnID: deref(event.Data.TurnID),
+			}})
+		case copilot.SessionEventTypeSessionWarning:
+			dispatch(Event{Type: EventSessionWarning, Runtime: &RuntimeEvent{
+				Type:    string(EventSessionWarning),
+				Content: deref(event.Data.Message),
+				Name:    deref(event.Data.WarningType),
+			}})
+		case copilot.SessionEventTypeSessionModelChange:
+			dispatch(Event{Type: EventSessionModelChange, Runtime: &RuntimeEvent{
+				Type:          string(EventSessionModelChange),
+				Model:         deref(event.Data.NewModel),
+				PreviousModel: deref(event.Data.PreviousModel),
+			}})
+		case copilot.SessionEventTypeToolExecutionProgress:
+			dispatch(Event{Type: EventToolExecutionProgress, Runtime: &RuntimeEvent{
+				Type:     string(EventToolExecutionProgress),
+				CallID:   deref(event.Data.ToolCallID),
+				ToolName: deref(event.Data.ToolName),
+				Content:  deref(event.Data.ProgressMessage),
+			}})
+		case copilot.SessionEventTypeToolExecutionPartialResult:
+			dispatch(Event{Type: EventToolExecutionPartialResult, Runtime: &RuntimeEvent{
+				Type:     string(EventToolExecutionPartialResult),
+				CallID:   deref(event.Data.ToolCallID),
+				ToolName: deref(event.Data.ToolName),
+				Content:  deref(event.Data.PartialOutput),
+			}})
 		case copilot.SessionEventTypeAssistantUsage:
 			currentUsage := Usage{
 				InputTokens:      int64FromFloat(event.Data.InputTokens),
@@ -565,6 +628,13 @@ func (s *copilotSession) Send(ctx context.Context, message MessageOptions, handl
 			case idleCh <- struct{}{}:
 			default:
 			}
+		default:
+			// Generic passthrough for unhandled SDK event types.
+			dispatch(Event{Type: EventGeneric, Runtime: &RuntimeEvent{
+				Type:    string(event.Type),
+				Content: deref(event.Data.Content),
+				Name:    deref(event.Data.Name),
+			}})
 		}
 
 		if cause := context.Cause(sendCtx); cause != nil {
@@ -869,6 +939,13 @@ func int64FromFloat(value *float64) int64 {
 		return 0
 	}
 	return int64(math.Round(*value))
+}
+
+func float64FromPtr(value *float64) float64 {
+	if value == nil {
+		return 0
+	}
+	return *value
 }
 
 func intFromInt64(value *int64) int {

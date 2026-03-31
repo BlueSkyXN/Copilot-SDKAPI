@@ -119,6 +119,7 @@
 | `GATEWAY_OTEL_FILE_PATH` | 空 | JSON-lines trace 输出文件路径。 |
 | `GATEWAY_OTEL_EXPORTER_TYPE` | 空 | 导出后端类型：`otlp-http` 或 `file`。 |
 | `GATEWAY_OTEL_SOURCE_NAME` | 空 | instrumentation scope 名称。 |
+| `GATEWAY_OTEL_CAPTURE_CONTENT` | 空 | 设置为 `true` 捕获消息内容（prompt 和 response）到 trace 数据中。 |
 
 ## 建议
 
